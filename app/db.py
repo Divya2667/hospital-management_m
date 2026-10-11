@@ -17,11 +17,29 @@ def get_client():
         return current_app._test_mongo_client
 
     if "mongo_client" not in g:
-        uri = current_app.config.get("MONGO_URI", "mongodb://localhost:27017/hospital_management")
-        if uri.startswith("mongomock://"):
+        uri = current_app.config.get("MONGO_URI", "")
+        is_vercel = bool(os.environ.get("VERCEL"))
+
+        # If running on Vercel without an external cloud MONGO_URI, use mongomock in-memory storage
+        if is_vercel and (not uri or "localhost" in uri or "127.0.0.1" in uri):
+            logger.info("Running on Vercel without external MONGO_URI. Using in-memory database.")
+            if not hasattr(current_app, "_vercel_mongo_client"):
+                current_app._vercel_mongo_client = mongomock.MongoClient()
+            return current_app._vercel_mongo_client
+
+        if not uri or uri.startswith("mongomock://"):
             g.mongo_client = mongomock.MongoClient()
         else:
-            g.mongo_client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+            try:
+                client = MongoClient(uri, serverSelectionTimeoutMS=3000)
+                client.admin.command("ping")
+                g.mongo_client = client
+            except Exception as e:
+                logger.warning("Could not connect to MongoDB URI (%s): %s. Falling back to in-memory database.", uri, e)
+                if not hasattr(current_app, "_fallback_mongo_client"):
+                    current_app._fallback_mongo_client = mongomock.MongoClient()
+                return current_app._fallback_mongo_client
+
     return g.mongo_client
 
 
