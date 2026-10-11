@@ -1,18 +1,24 @@
 import pytest
 from datetime import date, timedelta
 from werkzeug.security import generate_password_hash
-from app.db import get_db
+from app.db import get_db, get_next_sequence_value
 
 
 def login_admin(app, client):
     """Helper to authenticate admin user."""
     with app.app_context():
         db = get_db()
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-            ("admin_appt_tester", generate_password_hash("pass123"), "Admin"),
+        u_id = get_next_sequence_value(db, "User_ID")
+        db.users.update_one(
+            {"Username": "admin_appt_tester"},
+            {"$set": {
+                "User_ID": u_id,
+                "Username": "admin_appt_tester",
+                "Password_Hash": generate_password_hash("pass123"),
+                "Role": "Admin",
+            }},
+            upsert=True,
         )
-        db.commit()
 
     client.post("/auth/login", data={"username": "admin_appt_tester", "password": "pass123"})
 
@@ -21,20 +27,16 @@ def setup_sample_patient_and_doctor(app):
     """Helper to create patient and doctors in database."""
     with app.app_context():
         db = get_db()
-        cur = db.cursor()
-        cur.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Peter Parker', 22, 'Male', 'O+', 1)")
-        patient_id = cur.lastrowid
+        patient_id = get_next_sequence_value(db, "Patient_id")
+        doc_strange_id = get_next_sequence_value(db, "Doctor_ID")
+        doc_banner_id = get_next_sequence_value(db, "Doctor_ID")
+        doc_offduty_id = get_next_sequence_value(db, "Doctor_ID")
 
-        cur.execute("INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone, is_active) VALUES ('Dr. Strange', 'MD Sorcery', 15, '555-111-2222', 1)")
-        doc_strange_id = cur.lastrowid
+        db.patients.insert_one({"Patient_id": patient_id, "P_Name": "Peter Parker", "P_Age": 22, "P_Gender": "Male", "Blood_Group": "O+", "is_active": 1})
+        db.doctors.insert_one({"Doctor_ID": doc_strange_id, "D_Name": "Dr. Strange", "D_Qualification": "MD Sorcery", "Experience": 15, "D_Phone": "555-111-2222", "is_active": 1})
+        db.doctors.insert_one({"Doctor_ID": doc_banner_id, "D_Name": "Dr. Banner", "D_Qualification": "MD Oncology", "Experience": 18, "D_Phone": "555-333-4444", "is_active": 1})
+        db.doctors.insert_one({"Doctor_ID": doc_offduty_id, "D_Name": "Dr. Offduty", "D_Qualification": "MBBS", "Experience": 5, "D_Phone": "555-999-0000", "is_active": 0})
 
-        cur.execute("INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone, is_active) VALUES ('Dr. Banner', 'MD Oncology', 18, '555-333-4444', 1)")
-        doc_banner_id = cur.lastrowid
-
-        cur.execute("INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone, is_active) VALUES ('Dr. Offduty', 'MBBS', 5, '555-999-0000', 0)")
-        doc_offduty_id = cur.lastrowid
-
-        db.commit()
         return patient_id, doc_strange_id, doc_banner_id, doc_offduty_id
 
 
@@ -105,12 +107,7 @@ def test_appointment_validation_rules(app, client):
 
 
 def test_doctor_appointment_overlap_conflict_prevention(app, client):
-    """Comprehensive test for scheduling conflict detection:
-       - Exact overlap: REJECT
-       - Partial overlap: REJECT
-       - Non-overlapping consecutive slot: ALLOW
-       - Different doctor at same time: ALLOW
-    """
+    """Comprehensive test for scheduling conflict detection."""
     login_admin(app, client)
     p_id, d_strange, d_banner, _ = setup_sample_patient_and_doctor(app)
     appt_date = (date.today() + timedelta(days=3)).isoformat()
@@ -175,7 +172,8 @@ def test_appointment_cancellation_releases_slot(app, client):
     )
     with app.app_context():
         db = get_db()
-        appt_id = db.execute("SELECT Appointment_ID FROM Appointment WHERE Reason = 'Will be cancelled'").fetchone()[0]
+        appt = db.appointments.find_one({"Reason": "Will be cancelled"})
+        appt_id = appt["Appointment_ID"]
 
     # 2. Cancel the appointment
     cancel_res = client.post(f"/appointments/{appt_id}/cancel", follow_redirects=True)
@@ -184,8 +182,8 @@ def test_appointment_cancellation_releases_slot(app, client):
 
     with app.app_context():
         db = get_db()
-        status = db.execute("SELECT Status FROM Appointment WHERE Appointment_ID = ?", (appt_id,)).fetchone()[0]
-        assert status == "Cancelled"
+        doc = db.appointments.find_one({"Appointment_ID": appt_id})
+        assert doc["Status"] == "Cancelled"
 
     # 3. Book NEW appointment for the SAME doctor, SAME date, and SAME time (11:00 - 11:30) -> MUST SUCCEED
     rebook_res = client.post(
@@ -206,16 +204,18 @@ def test_appointment_edit_with_self_exclusion(app, client):
 
     with app.app_context():
         db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            """INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason, Duration_Min, Status)
-               VALUES (?, ?, ?, '14:00', 'Original Reason', 30, 'Scheduled')""",
-            (p_id, d_strange, appt_date),
-        )
-        appt_id = cur.lastrowid
-        db.commit()
+        appt_id = get_next_sequence_value(db, "Appointment_ID")
+        db.appointments.insert_one({
+            "Appointment_ID": appt_id,
+            "Patient_id": p_id,
+            "Doctor_ID": d_strange,
+            "A_Date": appt_date,
+            "A_Time": "14:00",
+            "Reason": "Original Reason",
+            "Duration_Min": 30,
+            "Status": "Scheduled",
+        })
 
-    # 1. Edit details keeping the exact same time -> Must NOT report a conflict against itself
     edit_res = client.post(
         f"/appointments/{appt_id}/edit",
         data={
@@ -233,26 +233,29 @@ def test_appointment_edit_with_self_exclusion(app, client):
 
     with app.app_context():
         db = get_db()
-        row = db.execute("SELECT Reason FROM Appointment WHERE Appointment_ID = ?", (appt_id,)).fetchone()
+        row = db.appointments.find_one({"Appointment_ID": appt_id})
         assert row["Reason"] == "Updated Reason Without Conflict"
 
 
 def test_appointment_status_complete(app, client):
-    """Marking an appointment as completed updates its status in SQLite."""
+    """Marking an appointment as completed updates its status in MongoDB."""
     login_admin(app, client)
     p_id, d_strange, _, _ = setup_sample_patient_and_doctor(app)
     appt_date = (date.today() + timedelta(days=2)).isoformat()
 
     with app.app_context():
         db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            """INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason, Duration_Min, Status)
-               VALUES (?, ?, ?, '15:00', 'Completion Test', 30, 'Scheduled')""",
-            (p_id, d_strange, appt_date),
-        )
-        appt_id = cur.lastrowid
-        db.commit()
+        appt_id = get_next_sequence_value(db, "Appointment_ID")
+        db.appointments.insert_one({
+            "Appointment_ID": appt_id,
+            "Patient_id": p_id,
+            "Doctor_ID": d_strange,
+            "A_Date": appt_date,
+            "A_Time": "15:00",
+            "Reason": "Completion Test",
+            "Duration_Min": 30,
+            "Status": "Scheduled",
+        })
 
     complete_res = client.post(f"/appointments/{appt_id}/complete", follow_redirects=True)
     assert complete_res.status_code == 200
@@ -260,8 +263,8 @@ def test_appointment_status_complete(app, client):
 
     with app.app_context():
         db = get_db()
-        status = db.execute("SELECT Status FROM Appointment WHERE Appointment_ID = ?", (appt_id,)).fetchone()[0]
-        assert status == "Completed"
+        doc = db.appointments.find_one({"Appointment_ID": appt_id})
+        assert doc["Status"] == "Completed"
 
 
 def test_appointment_search_and_filters(app, client):
@@ -273,15 +276,28 @@ def test_appointment_search_and_filters(app, client):
 
     with app.app_context():
         db = get_db()
-        db.execute(
-            "INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason, Duration_Min, Status) VALUES (?, ?, ?, '09:30', 'Headache Evaluation', 30, 'Scheduled')",
-            (p_id, d_strange, date1),
-        )
-        db.execute(
-            "INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason, Duration_Min, Status) VALUES (?, ?, ?, '11:00', 'Radiation Therapy Check', 30, 'Completed')",
-            (p_id, d_banner, date2),
-        )
-        db.commit()
+        a1 = get_next_sequence_value(db, "Appointment_ID")
+        a2 = get_next_sequence_value(db, "Appointment_ID")
+        db.appointments.insert_one({
+            "Appointment_ID": a1,
+            "Patient_id": p_id,
+            "Doctor_ID": d_strange,
+            "A_Date": date1,
+            "A_Time": "09:30",
+            "Reason": "Headache Evaluation",
+            "Duration_Min": 30,
+            "Status": "Scheduled",
+        })
+        db.appointments.insert_one({
+            "Appointment_ID": a2,
+            "Patient_id": p_id,
+            "Doctor_ID": d_banner,
+            "A_Date": date2,
+            "A_Time": "11:00",
+            "Reason": "Radiation Therapy Check",
+            "Duration_Min": 30,
+            "Status": "Completed",
+        })
 
     # Search by keyword in reason "Headache"
     res_search = client.get("/appointments/?search=Headache")

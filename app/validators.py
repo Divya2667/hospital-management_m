@@ -32,31 +32,28 @@ def check_appointment_overlap(db, doctor_id, date_str, start_min, end_min, exclu
     Returns:
         (has_conflict: bool, conflicting_appointment: dict or None)
     """
-    query = """
-        SELECT Appointment_ID, A_Time, Duration_Min, Status
-        FROM Appointment
-        WHERE Doctor_ID = ? AND A_Date = ? AND Status != 'Cancelled'
-    """
-    params = [doctor_id, date_str]
-
+    filter_query = {
+        "Doctor_ID": int(doctor_id),
+        "A_Date": str(date_str),
+        "Status": {"$ne": "Cancelled"},
+    }
     if exclude_appointment_id is not None:
-        query += " AND Appointment_ID != ?"
-        params.append(exclude_appointment_id)
+        filter_query["Appointment_ID"] = {"$ne": int(exclude_appointment_id)}
 
-    existing_appointments = db.execute(query, params).fetchall()
+    existing_appointments = list(db.appointments.find(filter_query))
 
     for appt in existing_appointments:
-        exist_start = time_to_minutes(appt["A_Time"])
+        exist_start = time_to_minutes(appt.get("A_Time"))
         if exist_start is None:
             continue
-        exist_duration = appt["Duration_Min"] or 30
+        exist_duration = appt.get("Duration_Min") or 30
         exist_end = exist_start + exist_duration
 
         # Precise interval overlap condition: [S_new, E_new) overlaps [S_exist, E_exist)
         if start_min < exist_end and end_min > exist_start:
             return True, {
-                "Appointment_ID": appt["Appointment_ID"],
-                "Start_Time": appt["A_Time"],
+                "Appointment_ID": appt.get("Appointment_ID"),
+                "Start_Time": appt.get("A_Time"),
                 "End_Time": minutes_to_time(exist_end),
                 "Duration_Min": exist_duration,
             }
@@ -172,10 +169,7 @@ def validate_bill(patient_id_raw, date_str, amount_raw, pay_mode, db=None):
     else:
         cleaned_patient_id = int(patient_id_raw)
         if db is not None:
-            patient_exists = db.execute(
-                "SELECT Patient_id FROM Patient WHERE Patient_id = ?",
-                (cleaned_patient_id,),
-            ).fetchone()
+            patient_exists = db.patients.find_one({"Patient_id": cleaned_patient_id})
             if not patient_exists:
                 errors.append("The selected patient does not exist in the database.")
 

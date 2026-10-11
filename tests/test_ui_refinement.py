@@ -1,17 +1,23 @@
 import pytest
 from werkzeug.security import generate_password_hash
-from app.db import get_db
+from app.db import get_db, get_next_sequence_value
 
 
 def login_admin(app, client):
     """Helper to authenticate admin user."""
     with app.app_context():
         db = get_db()
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-            ("admin_ui_tester", generate_password_hash("pass123"), "Admin"),
+        u_id = get_next_sequence_value(db, "User_ID")
+        db.users.update_one(
+            {"Username": "admin_ui_tester"},
+            {"$set": {
+                "User_ID": u_id,
+                "Username": "admin_ui_tester",
+                "Password_Hash": generate_password_hash("pass123"),
+                "Role": "Admin",
+            }},
+            upsert=True,
         )
-        db.commit()
 
     client.post("/auth/login", data={"username": "admin_ui_tester", "password": "pass123"})
 
@@ -44,19 +50,16 @@ def test_base_layout_top_navigation_and_quick_action(app, client):
     resp = client.get("/dashboard", follow_redirects=True)
     assert resp.status_code == 200
 
-    # Quick action elements
     assert b"quickActionsDropdown" in resp.data
     assert b"Register Patient" in resp.data
     assert b"Add Doctor" in resp.data
     assert b"Book Appointment" in resp.data
     assert b"Issue Invoice" in resp.data
 
-    # Search & Quick Nav modal
     assert b"quickNavModal" in resp.data
     assert b"quickNavInput" in resp.data
     assert b"Ctrl K" in resp.data
 
-    # Live pulse clinic hours
     assert b"pulse-indicator" in resp.data
     assert b"CLINIC_OPEN_TIME" in resp.data or b"09:00" in resp.data
 
@@ -65,7 +68,6 @@ def test_flash_messages_container_and_dismissibility(app, client):
     """Test flash message structure, styling, and alert container."""
     login_admin(app, client)
 
-    # Trigger a flash message by submitting invalid patient form
     resp = client.post("/patients/create", data={"name": ""}, follow_redirects=True)
     assert resp.status_code == 200
     assert b"flash-messages-container" in resp.data
@@ -79,14 +81,15 @@ def test_doctor_title_clean_rendering_no_double_prefix(app, client):
 
     with app.app_context():
         db = get_db()
-        db.execute(
-            """
-            INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone, is_active)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            ("Dr. Stephen Strange", "MD Sorcery", 15, "555-888-9999", 1),
-        )
-        db.commit()
+        d_id = get_next_sequence_value(db, "Doctor_ID")
+        db.doctors.insert_one({
+            "Doctor_ID": d_id,
+            "D_Name": "Dr. Stephen Strange",
+            "D_Qualification": "MD Sorcery",
+            "Experience": 15,
+            "D_Phone": "555-888-9999",
+            "is_active": 1,
+        })
 
     resp = client.get("/appointments/create")
     assert resp.status_code == 200

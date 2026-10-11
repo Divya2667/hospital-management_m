@@ -1,4 +1,5 @@
-import sqlite3
+import re
+from datetime import datetime
 from flask import (
     Blueprint,
     flash,
@@ -10,7 +11,7 @@ from flask import (
     abort,
 )
 from app.auth import login_required
-from app.db import get_db
+from app.db import get_db, get_next_sequence_value
 from app.validators import (
     validate_patient,
     ALLOWED_GENDERS,
@@ -28,30 +29,26 @@ def index():
     search = request.args.get("search", "").strip()
     status_filter = request.args.get("status", "all").strip().lower()
 
-    query = "SELECT * FROM Patient WHERE 1=1"
-    params = []
+    query = {}
 
-    # Search filter (by Name or Patient ID)
     if search:
         if search.isdigit():
-            query += " AND (Patient_id = ? OR P_Name LIKE ?)"
-            params.extend([int(search), f"%{search}%"])
+            query["$or"] = [
+                {"Patient_id": int(search)},
+                {"P_Name": {"$regex": re.escape(search), "$options": "i"}}
+            ]
         else:
-            query += " AND P_Name LIKE ?"
-            params.append(f"%{search}%")
+            query["P_Name"] = {"$regex": re.escape(search), "$options": "i"}
 
-    # Status filter
     if status_filter == "active":
-        query += " AND is_active = 1"
+        query["is_active"] = 1
     elif status_filter == "inactive":
-        query += " AND is_active = 0"
+        query["is_active"] = 0
 
-    query += " ORDER BY Patient_id DESC"
-    patients = db.execute(query, params).fetchall()
+    patients = list(db.patients.find(query).sort("Patient_id", -1))
 
-    # Total counts for filter pills
-    active_count = db.execute("SELECT COUNT(*) FROM Patient WHERE is_active = 1").fetchone()[0]
-    total_count = db.execute("SELECT COUNT(*) FROM Patient").fetchone()[0]
+    total_count = db.patients.count_documents({})
+    active_count = db.patients.count_documents({"is_active": 1})
     inactive_count = total_count - active_count
 
     return render_template(
@@ -80,21 +77,19 @@ def create():
         if not errors:
             db = get_db()
             try:
-                cur = db.execute(
-                    """INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active)
-                       VALUES (?, ?, ?, ?, 1)""",
-                    (
-                        cleaned_data["P_Name"],
-                        cleaned_data["P_Age"],
-                        cleaned_data["P_Gender"],
-                        cleaned_data["Blood_Group"],
-                    ),
-                )
-                db.commit()
-                new_patient_id = cur.lastrowid
+                new_patient_id = get_next_sequence_value(db, "Patient_id")
+                db.patients.insert_one({
+                    "Patient_id": new_patient_id,
+                    "P_Name": cleaned_data["P_Name"],
+                    "P_Age": cleaned_data["P_Age"],
+                    "P_Gender": cleaned_data["P_Gender"],
+                    "Blood_Group": cleaned_data["Blood_Group"],
+                    "is_active": 1,
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
                 flash(f"Patient '{cleaned_data['P_Name']}' (ID: #{new_patient_id}) registered successfully.", "success")
                 return redirect(url_for("patients.detail", patient_id=new_patient_id))
-            except sqlite3.Error as e:
+            except Exception as e:
                 flash(f"Database error registering patient: {e}", "danger")
         else:
             for error in errors:
@@ -112,46 +107,24 @@ def create():
 def detail(patient_id):
     """View patient details, complete appointment history, and billing history."""
     db = get_db()
-    patient = db.execute("SELECT * FROM Patient WHERE Patient_id = ?", (patient_id,)).fetchone()
+    patient = db.patients.find_one({"Patient_id": patient_id})
     if patient is None:
         flash(f"Patient #{patient_id} was not found.", "warning")
         return redirect(url_for("patients.index"))
 
     # Patient's appointment history with assigned Doctor details
-    appointments = db.execute(
-        """
-        SELECT 
-            a.Appointment_ID,
-            a.A_Date,
-            a.A_Time,
-            a.Reason,
-            a.Duration_Min,
-            a.Status,
-            a.Created_At,
-            d.Doctor_ID,
-            d.D_Name AS Doctor_Name,
-            d.D_Qualification
-        FROM Appointment a
-        JOIN Doctor d ON a.Doctor_ID = d.Doctor_ID
-        WHERE a.Patient_id = ?
-        ORDER BY a.A_Date DESC, a.A_Time DESC
-        """,
-        (patient_id,),
-    ).fetchall()
+    raw_appts = list(db.appointments.find({"Patient_id": patient_id}).sort([("A_Date", -1), ("A_Time", -1)]))
+    appointments = []
+    for a in raw_appts:
+        doc = db.doctors.find_one({"Doctor_ID": a.get("Doctor_ID")}) or {}
+        a_copy = dict(a)
+        a_copy["Doctor_Name"] = doc.get("D_Name", "Unknown Doctor")
+        a_copy["D_Qualification"] = doc.get("D_Qualification", "")
+        appointments.append(a_copy)
 
     # Patient's billing history
-    bills = db.execute(
-        """
-        SELECT Bill_ID, B_Date, B_Amount, Pay_Mode, Created_At
-        FROM Bill
-        WHERE Patient_id = ?
-        ORDER BY Bill_ID DESC
-        """,
-        (patient_id,),
-    ).fetchall()
-
-    # Calculate total bills amount for this patient
-    total_billed = sum(bill["B_Amount"] for bill in bills)
+    bills = list(db.bills.find({"Patient_id": patient_id}).sort("Bill_ID", -1))
+    total_billed = sum(bill.get("B_Amount", 0.0) for bill in bills)
 
     return render_template(
         "patients/detail.html",
@@ -167,7 +140,7 @@ def detail(patient_id):
 def edit(patient_id):
     """Edit patient information."""
     db = get_db()
-    patient = db.execute("SELECT * FROM Patient WHERE Patient_id = ?", (patient_id,)).fetchone()
+    patient = db.patients.find_one({"Patient_id": patient_id})
     if patient is None:
         flash(f"Patient #{patient_id} was not found.", "warning")
         return redirect(url_for("patients.index"))
@@ -182,22 +155,18 @@ def edit(patient_id):
 
         if not errors:
             try:
-                db.execute(
-                    """UPDATE Patient
-                       SET P_Name = ?, P_Age = ?, P_Gender = ?, Blood_Group = ?
-                       WHERE Patient_id = ?""",
-                    (
-                        cleaned_data["P_Name"],
-                        cleaned_data["P_Age"],
-                        cleaned_data["P_Gender"],
-                        cleaned_data["Blood_Group"],
-                        patient_id,
-                    ),
+                db.patients.update_one(
+                    {"Patient_id": patient_id},
+                    {"$set": {
+                        "P_Name": cleaned_data["P_Name"],
+                        "P_Age": cleaned_data["P_Age"],
+                        "P_Gender": cleaned_data["P_Gender"],
+                        "Blood_Group": cleaned_data["Blood_Group"],
+                    }}
                 )
-                db.commit()
                 flash(f"Patient #{patient_id} updated successfully.", "success")
                 return redirect(url_for("patients.detail", patient_id=patient_id))
-            except sqlite3.Error as e:
+            except Exception as e:
                 flash(f"Database error updating patient: {e}", "danger")
         else:
             for error in errors:
@@ -216,17 +185,17 @@ def edit(patient_id):
 def toggle_status(patient_id):
     """Toggle patient active / inactive status safely without destroying history."""
     db = get_db()
-    patient = db.execute("SELECT Patient_id, P_Name, is_active FROM Patient WHERE Patient_id = ?", (patient_id,)).fetchone()
+    patient = db.patients.find_one({"Patient_id": patient_id})
     if patient is None:
         flash(f"Patient #{patient_id} not found.", "warning")
         return redirect(url_for("patients.index"))
 
-    new_status = 0 if patient["is_active"] == 1 else 1
-    db.execute("UPDATE Patient SET is_active = ? WHERE Patient_id = ?", (new_status, patient_id))
-    db.commit()
+    current_active = patient.get("is_active", 1)
+    new_status = 0 if current_active == 1 else 1
+    db.patients.update_one({"Patient_id": patient_id}, {"$set": {"is_active": new_status}})
 
     action = "deactivated" if new_status == 0 else "reactivated"
-    flash(f"Patient '{patient['P_Name']}' has been {action}.", "info")
+    flash(f"Patient '{patient.get('P_Name')}' has been {action}.", "info")
     return redirect(request.referrer or url_for("patients.detail", patient_id=patient_id))
 
 
@@ -235,14 +204,13 @@ def toggle_status(patient_id):
 def delete(patient_id):
     """Safely handle deletion attempts. Blocks deletion if patient has appointments or bills."""
     db = get_db()
-    patient = db.execute("SELECT Patient_id, P_Name FROM Patient WHERE Patient_id = ?", (patient_id,)).fetchone()
+    patient = db.patients.find_one({"Patient_id": patient_id})
     if patient is None:
         flash(f"Patient #{patient_id} not found.", "warning")
         return redirect(url_for("patients.index"))
 
-    # Check for historical records to protect relational integrity
-    appt_count = db.execute("SELECT COUNT(*) FROM Appointment WHERE Patient_id = ?", (patient_id,)).fetchone()[0]
-    bill_count = db.execute("SELECT COUNT(*) FROM Bill WHERE Patient_id = ?", (patient_id,)).fetchone()[0]
+    appt_count = db.appointments.count_documents({"Patient_id": patient_id})
+    bill_count = db.bills.count_documents({"Patient_id": patient_id})
 
     if appt_count > 0 or bill_count > 0:
         flash(
@@ -254,13 +222,9 @@ def delete(patient_id):
         return redirect(url_for("patients.detail", patient_id=patient_id))
 
     try:
-        db.execute("DELETE FROM Patient WHERE Patient_id = ?", (patient_id,))
-        db.commit()
+        db.patients.delete_one({"Patient_id": patient_id})
         flash(f"Patient record '{patient['P_Name']}' (ID: #{patient_id}) was successfully deleted.", "success")
         return redirect(url_for("patients.index"))
-    except sqlite3.IntegrityError:
-        flash(
-            f"Cannot delete patient #{patient_id} due to active database foreign key constraints.",
-            "danger",
-        )
+    except Exception as e:
+        flash(f"Cannot delete patient #{patient_id}: {e}", "danger")
         return redirect(url_for("patients.detail", patient_id=patient_id))

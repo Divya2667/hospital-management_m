@@ -4,14 +4,13 @@ from app.db import init_db
 
 
 @pytest.fixture
-def app(tmp_path):
-    """Create and configure a fresh app instance with a dedicated temp SQLite database for each test."""
-    db_file = tmp_path / "test_hospital.db"
-
+def app():
+    """Create and configure a fresh app instance with mongomock for isolated testing."""
     test_app = create_app(
         test_config={
             "TESTING": True,
-            "DATABASE": str(db_file),
+            "MONGO_URI": "mongomock://localhost",
+            "MONGO_DB_NAME": "hospital_test_db",
             "WTF_CSRF_ENABLED": False,
             "SECRET_KEY": "test-secret-key-hospital-mgmt",
         }

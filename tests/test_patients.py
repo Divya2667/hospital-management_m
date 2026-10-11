@@ -1,17 +1,23 @@
 import pytest
 from werkzeug.security import generate_password_hash
-from app.db import get_db
+from app.db import get_db, get_next_sequence_value
 
 
 def login_admin(app, client):
     """Helper to authenticate a staff/admin user."""
     with app.app_context():
         db = get_db()
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-            ("admin_patient_test", generate_password_hash("pass123"), "Admin"),
+        u_id = get_next_sequence_value(db, "User_ID")
+        db.users.update_one(
+            {"Username": "admin_patient_test"},
+            {"$set": {
+                "User_ID": u_id,
+                "Username": "admin_patient_test",
+                "Password_Hash": generate_password_hash("pass123"),
+                "Role": "Admin",
+            }},
+            upsert=True,
         )
-        db.commit()
 
     client.post("/auth/login", data={"username": "admin_patient_test", "password": "pass123"})
 
@@ -76,7 +82,7 @@ def test_patient_create_validation_and_success(app, client):
 
     with app.app_context():
         db = get_db()
-        patient = db.execute("SELECT * FROM Patient WHERE P_Name = 'Samantha Wright'").fetchone()
+        patient = db.patients.find_one({"P_Name": "Samantha Wright"})
         assert patient is not None
         assert patient["P_Age"] == 29
         assert patient["P_Gender"] == "Female"
@@ -90,12 +96,15 @@ def test_patient_edit(app, client):
 
     with app.app_context():
         db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            "INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Robert Fox', 50, 'Male', 'A+', 1)"
-        )
-        patient_id = cur.lastrowid
-        db.commit()
+        patient_id = get_next_sequence_value(db, "Patient_id")
+        db.patients.insert_one({
+            "Patient_id": patient_id,
+            "P_Name": "Robert Fox",
+            "P_Age": 50,
+            "P_Gender": "Male",
+            "Blood_Group": "A+",
+            "is_active": 1,
+        })
 
     # GET edit form
     get_res = client.get(f"/patients/{patient_id}/edit")
@@ -115,7 +124,7 @@ def test_patient_edit(app, client):
 
     with app.app_context():
         db = get_db()
-        updated = db.execute("SELECT * FROM Patient WHERE Patient_id = ?", (patient_id,)).fetchone()
+        updated = db.patients.find_one({"Patient_id": patient_id})
         assert updated["P_Name"] == "Robert Fox Jr."
         assert updated["P_Age"] == 51
         assert updated["Blood_Group"] == "AB+"
@@ -127,23 +136,25 @@ def test_patient_search_and_status_filtering(app, client):
 
     with app.app_context():
         db = get_db()
-        db.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Alice Johnson', 25, 'Female', 'O+', 1)")
-        db.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Bob Smith', 40, 'Male', 'A-', 0)")
-        db.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Alicia Keys', 35, 'Female', 'B+', 1)")
-        db.commit()
+        p1 = get_next_sequence_value(db, "Patient_id")
+        p2 = get_next_sequence_value(db, "Patient_id")
+        p3 = get_next_sequence_value(db, "Patient_id")
+        db.patients.insert_one({"Patient_id": p1, "P_Name": "Alice Johnson", "P_Age": 25, "P_Gender": "Female", "Blood_Group": "O+", "is_active": 1})
+        db.patients.insert_one({"Patient_id": p2, "P_Name": "Bob Smith", "P_Age": 40, "P_Gender": "Male", "Blood_Group": "A-", "is_active": 0})
+        db.patients.insert_one({"Patient_id": p3, "P_Name": "Alicia Keys", "P_Age": 35, "P_Gender": "Female", "Blood_Group": "B+", "is_active": 1})
 
-    # Search by partial name "Alic" -> should find Alice and Alicia, but not Bob
+    # Search by partial name "Alic"
     search_res = client.get("/patients/?search=Alic")
     assert b"Alice Johnson" in search_res.data
     assert b"Alicia Keys" in search_res.data
     assert b"Bob Smith" not in search_res.data
 
-    # Filter active only -> Alice and Alicia, no Bob
+    # Filter active only
     active_res = client.get("/patients/?status=active")
     assert b"Alice Johnson" in active_res.data
     assert b"Bob Smith" not in active_res.data
 
-    # Filter inactive only -> Bob only
+    # Filter inactive only
     inactive_res = client.get("/patients/?status=inactive")
     assert b"Bob Smith" in inactive_res.data
     assert b"Alice Johnson" not in inactive_res.data
@@ -155,10 +166,8 @@ def test_patient_deactivation_toggle(app, client):
 
     with app.app_context():
         db = get_db()
-        cur = db.cursor()
-        cur.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Mark Otto', 33, 'Male', 'O-', 1)")
-        patient_id = cur.lastrowid
-        db.commit()
+        patient_id = get_next_sequence_value(db, "Patient_id")
+        db.patients.insert_one({"Patient_id": patient_id, "P_Name": "Mark Otto", "P_Age": 33, "P_Gender": "Male", "Blood_Group": "O-", "is_active": 1})
 
     # Deactivate
     toggle_res = client.post(f"/patients/{patient_id}/toggle-status", follow_redirects=True)
@@ -167,7 +176,8 @@ def test_patient_deactivation_toggle(app, client):
 
     with app.app_context():
         db = get_db()
-        assert db.execute("SELECT is_active FROM Patient WHERE Patient_id = ?", (patient_id,)).fetchone()[0] == 0
+        doc = db.patients.find_one({"Patient_id": patient_id})
+        assert doc["is_active"] == 0
 
     # Reactivate
     toggle_res2 = client.post(f"/patients/{patient_id}/toggle-status", follow_redirects=True)
@@ -176,7 +186,8 @@ def test_patient_deactivation_toggle(app, client):
 
     with app.app_context():
         db = get_db()
-        assert db.execute("SELECT is_active FROM Patient WHERE Patient_id = ?", (patient_id,)).fetchone()[0] == 1
+        doc = db.patients.find_one({"Patient_id": patient_id})
+        assert doc["is_active"] == 1
 
 
 def test_patient_detail_appointment_and_billing_history(app, client):
@@ -185,35 +196,32 @@ def test_patient_detail_appointment_and_billing_history(app, client):
 
     with app.app_context():
         db = get_db()
-        cur = db.cursor()
+        p_id = get_next_sequence_value(db, "Patient_id")
+        d_id = get_next_sequence_value(db, "Doctor_ID")
+        a_id = get_next_sequence_value(db, "Appointment_ID")
+        b_id_1 = get_next_sequence_value(db, "Bill_ID")
+        b_id_2 = get_next_sequence_value(db, "Bill_ID")
 
-        # Insert Patient
-        cur.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Clara Oswald', 26, 'Female', 'AB+', 1)")
-        p_id = cur.lastrowid
-
-        # Insert Doctor
-        cur.execute("INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone, is_active) VALUES ('Dr. Who', 'MD Time Lord', 900, '555-TARDIS', 1)")
-        d_id = cur.lastrowid
-
-        # Insert Appointment
-        cur.execute(
-            """INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason, Duration_Min, Status)
-               VALUES (?, ?, '2026-10-20', '09:30', 'Tachyon Exposure Check', 30, 'Scheduled')""",
-            (p_id, d_id),
-        )
-
-        # Insert Bills
-        cur.execute("INSERT INTO Bill (Patient_id, B_Date, B_Amount, Pay_Mode) VALUES (?, '2026-10-18', 350.00, 'Insurance')", (p_id,))
-        cur.execute("INSERT INTO Bill (Patient_id, B_Date, B_Amount, Pay_Mode) VALUES (?, '2026-10-20', 120.50, 'Card')", (p_id,))
-        db.commit()
+        db.patients.insert_one({"Patient_id": p_id, "P_Name": "Clara Oswald", "P_Age": 26, "P_Gender": "Female", "Blood_Group": "AB+", "is_active": 1})
+        db.doctors.insert_one({"Doctor_ID": d_id, "D_Name": "Dr. Who", "D_Qualification": "MD Time Lord", "Experience": 900, "D_Phone": "555-TARDIS", "is_active": 1})
+        db.appointments.insert_one({
+            "Appointment_ID": a_id,
+            "Patient_id": p_id,
+            "Doctor_ID": d_id,
+            "A_Date": "2026-10-20",
+            "A_Time": "09:30",
+            "Reason": "Tachyon Exposure Check",
+            "Duration_Min": 30,
+            "Status": "Scheduled",
+        })
+        db.bills.insert_one({"Bill_ID": b_id_1, "Patient_id": p_id, "B_Date": "2026-10-18", "B_Amount": 350.00, "Pay_Mode": "Insurance"})
+        db.bills.insert_one({"Bill_ID": b_id_2, "Patient_id": p_id, "B_Date": "2026-10-20", "B_Amount": 120.50, "Pay_Mode": "Card"})
 
     detail_res = client.get(f"/patients/{p_id}")
     assert detail_res.status_code == 200
-    # Appointment verified
     assert b"Dr. Who" in detail_res.data
     assert b"Tachyon Exposure Check" in detail_res.data
     assert b"2026-10-20" in detail_res.data
-    # Bills and total verified ($350 + $120.50 = $470.50)
     assert b"$350.00" in detail_res.data
     assert b"$120.50" in detail_res.data
     assert b"$470.50" in detail_res.data
@@ -225,24 +233,31 @@ def test_patient_safe_deletion_prevented_with_records(app, client):
 
     with app.app_context():
         db = get_db()
-        cur = db.cursor()
-        cur.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Protected Patient', 45, 'Male', 'O+', 1)")
-        p_id = cur.lastrowid
-        cur.execute("INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone, is_active) VALUES ('Dr. Care', 'MBBS', 5, '555-001', 1)")
-        d_id = cur.lastrowid
-        cur.execute("INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason) VALUES (?, ?, '2026-10-22', '11:00', 'Checkup')", (p_id, d_id))
-        db.commit()
+        p_id = get_next_sequence_value(db, "Patient_id")
+        d_id = get_next_sequence_value(db, "Doctor_ID")
+        a_id = get_next_sequence_value(db, "Appointment_ID")
 
-    # Attempt deletion of patient who has appointment
+        db.patients.insert_one({"Patient_id": p_id, "P_Name": "Protected Patient", "P_Age": 45, "P_Gender": "Male", "Blood_Group": "O+", "is_active": 1})
+        db.doctors.insert_one({"Doctor_ID": d_id, "D_Name": "Dr. Care", "D_Qualification": "MBBS", "Experience": 5, "D_Phone": "555-001", "is_active": 1})
+        db.appointments.insert_one({
+            "Appointment_ID": a_id,
+            "Patient_id": p_id,
+            "Doctor_ID": d_id,
+            "A_Date": "2026-10-22",
+            "A_Time": "11:00",
+            "Reason": "Checkup",
+            "Duration_Min": 30,
+            "Status": "Scheduled",
+        })
+
     del_res = client.post(f"/patients/{p_id}/delete", follow_redirects=True)
     assert del_res.status_code == 200
     assert b"Cannot delete Patient" in del_res.data
     assert b"Please deactivate the patient instead" in del_res.data
 
-    # Verify patient still exists in database
     with app.app_context():
         db = get_db()
-        assert db.execute("SELECT * FROM Patient WHERE Patient_id = ?", (p_id,)).fetchone() is not None
+        assert db.patients.find_one({"Patient_id": p_id}) is not None
 
 
 def test_patient_deletion_success_standalone(app, client):
@@ -251,17 +266,13 @@ def test_patient_deletion_success_standalone(app, client):
 
     with app.app_context():
         db = get_db()
-        cur = db.cursor()
-        cur.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Disposable Patient', 22, 'Other', 'A+', 1)")
-        p_id = cur.lastrowid
-        db.commit()
+        p_id = get_next_sequence_value(db, "Patient_id")
+        db.patients.insert_one({"Patient_id": p_id, "P_Name": "Disposable Patient", "P_Age": 22, "P_Gender": "Other", "Blood_Group": "A+", "is_active": 1})
 
-    # Delete standalone patient
     del_res = client.post(f"/patients/{p_id}/delete", follow_redirects=True)
     assert del_res.status_code == 200
     assert b"was successfully deleted." in del_res.data
 
-    # Verify patient is gone
     with app.app_context():
         db = get_db()
-        assert db.execute("SELECT * FROM Patient WHERE Patient_id = ?", (p_id,)).fetchone() is None
+        assert db.patients.find_one({"Patient_id": p_id}) is None

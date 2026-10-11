@@ -11,7 +11,7 @@ from flask import (
     url_for,
 )
 from werkzeug.security import check_password_hash, generate_password_hash
-from app.db import get_db
+from app.db import get_db, get_next_sequence_value
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
 
@@ -36,17 +36,13 @@ def load_logged_in_user():
         g.user = None
     else:
         db = get_db()
-        g.user = db.execute(
-            "SELECT User_ID, Username, Role, Created_At FROM User WHERE User_ID = ?",
-            (user_id,),
-        ).fetchone()
+        g.user = db.users.find_one({"User_ID": user_id})
 
 
 @bp.route("/login", methods=("GET", "POST"))
 def login():
     """Authenticate administrator or staff members and initiate session."""
     if request.method == "GET":
-        # Clear authenticated identity so login portal always prompts for credentials
         session.pop("user_id", None)
         session.pop("username", None)
         session.pop("role", None)
@@ -61,23 +57,18 @@ def login():
             error = "Please provide both username and password."
         else:
             db = get_db()
-            user = db.execute(
-                "SELECT User_ID, Username, Password_Hash, Role FROM User WHERE Username = ?",
-                (username,),
-            ).fetchone()
+            user = db.users.find_one({"Username": username})
 
             if user is None or not check_password_hash(user["Password_Hash"], password):
                 error = "Invalid username or password."
 
         if error is None:
-            # Clear old session data and store authenticated identity
             session.clear()
             session["user_id"] = user["User_ID"]
             session["username"] = user["Username"]
-            session["role"] = user["Role"]
+            session["role"] = user.get("Role", "Admin")
 
             next_page = request.args.get("next")
-            # Prevent open redirects by ensuring the next URL is relative
             if not next_page or not next_page.startswith("/"):
                 next_page = url_for("dashboard.index")
 
@@ -116,7 +107,7 @@ from flask.cli import with_appcontext
 )
 @with_appcontext
 def create_admin_command(username, password, role):
-    """Create or register an administrator account in the SQLite database."""
+    """Create or register an administrator account in MongoDB."""
     username = username.strip()
     if not username or not password:
         click.echo("Error: Username and password cannot be empty.")
@@ -124,15 +115,18 @@ def create_admin_command(username, password, role):
 
     password_hash = generate_password_hash(password)
     db = get_db()
-    try:
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-            (username, password_hash, role),
-        )
-        db.commit()
-        click.echo(f"Administrator account '{username}' (Role: {role}) created successfully.")
-    except db.IntegrityError:
+    if db.users.find_one({"Username": username}):
         click.echo(f"Error: A user with username '{username}' already exists.")
+        return
+
+    user_id = get_next_sequence_value(db, "User_ID")
+    db.users.insert_one({
+        "User_ID": user_id,
+        "Username": username,
+        "Password_Hash": password_hash,
+        "Role": role,
+    })
+    click.echo(f"Administrator account '{username}' (Role: {role}) created successfully.")
 
 
 def init_app(app):

@@ -14,98 +14,65 @@ def root():
 @bp.route("/dashboard")
 @login_required
 def index():
-    """Render the central dashboard with live aggregate metrics and recent records from SQLite."""
+    """Render the central dashboard with live aggregate metrics and recent records from MongoDB."""
     db = get_db()
 
-    # 1. Metric: Total active patients
-    active_patients_count = db.execute(
-        "SELECT COUNT(*) FROM Patient WHERE is_active = 1"
-    ).fetchone()[0]
+    # 1. Patient Metrics
+    active_patients_count = db.patients.count_documents({"is_active": 1})
+    total_patients_count = db.patients.count_documents({})
 
-    # Total registered patients (including inactive)
-    total_patients_count = db.execute(
-        "SELECT COUNT(*) FROM Patient"
-    ).fetchone()[0]
+    # 2. Doctor Metrics
+    active_doctors_count = db.doctors.count_documents({"is_active": 1})
 
-    # 2. Metric: Total active doctors
-    active_doctors_count = db.execute(
-        "SELECT COUNT(*) FROM Doctor WHERE is_active = 1"
-    ).fetchone()[0]
+    # 3. Appointment Metrics
+    total_appointments_count = db.appointments.count_documents({})
+    scheduled_appointments_count = db.appointments.count_documents({"Status": "Scheduled"})
 
-    # 3. Metric: Total appointments and scheduled count
-    total_appointments_count = db.execute(
-        "SELECT COUNT(*) FROM Appointment"
-    ).fetchone()[0]
+    # 4. Financial Metrics
+    total_bills_count = db.bills.count_documents({})
+    rev_pipe = [{"$group": {"_id": None, "total": {"$sum": "$B_Amount"}}}]
+    rev_res = list(db.bills.aggregate(rev_pipe))
+    total_revenue = rev_res[0]["total"] if rev_res else 0.0
 
-    scheduled_appointments_count = db.execute(
-        "SELECT COUNT(*) FROM Appointment WHERE Status = 'Scheduled'"
-    ).fetchone()[0]
+    # 5. Recent Appointments with Patient & Doctor details
+    raw_recent_appts = list(db.appointments.find({}).sort([("A_Date", -1), ("A_Time", -1)]).limit(5))
+    recent_appointments = []
+    for a in raw_recent_appts:
+        p = db.patients.find_one({"Patient_id": a.get("Patient_id")}) or {}
+        d = db.doctors.find_one({"Doctor_ID": a.get("Doctor_ID")}) or {}
+        a_copy = dict(a)
+        a_copy["Patient_Name"] = p.get("P_Name", "Unknown Patient")
+        a_copy["Doctor_Name"] = d.get("D_Name", "Unknown Doctor")
+        recent_appointments.append(a_copy)
 
-    # 4. Metric: Total bills and total revenue amount
-    bill_stats = db.execute(
-        "SELECT COUNT(*), COALESCE(SUM(B_Amount), 0.0) FROM Bill"
-    ).fetchone()
-    total_bills_count = bill_stats[0]
-    total_revenue = bill_stats[1]
-
-    # 5. Recent / Upcoming Appointments with Patient & Doctor JOINs
-    recent_appointments = db.execute(
-        """
-        SELECT 
-            a.Appointment_ID,
-            a.A_Date,
-            a.A_Time,
-            a.Reason,
-            a.Duration_Min,
-            a.Status,
-            p.Patient_id,
-            p.P_Name AS Patient_Name,
-            d.Doctor_ID,
-            d.D_Name AS Doctor_Name
-        FROM Appointment a
-        JOIN Patient p ON a.Patient_id = p.Patient_id
-        JOIN Doctor d ON a.Doctor_ID = d.Doctor_ID
-        ORDER BY a.A_Date DESC, a.A_Time DESC
-        LIMIT 5
-        """
-    ).fetchall()
-
-    # 6. Recently Created Bills with Patient JOIN
-    recent_bills = db.execute(
-        """
-        SELECT 
-            b.Bill_ID,
-            b.B_Date,
-            b.B_Amount,
-            b.Pay_Mode,
-            b.Created_At,
-            p.Patient_id,
-            p.P_Name AS Patient_Name
-        FROM Bill b
-        JOIN Patient p ON b.Patient_id = p.Patient_id
-        ORDER BY b.Bill_ID DESC
-        LIMIT 5
-        """
-    ).fetchall()
+    # 6. Recent Bills with Patient details
+    raw_recent_bills = list(db.bills.find({}).sort("Bill_ID", -1).limit(5))
+    recent_bills = []
+    for b in raw_recent_bills:
+        p = db.patients.find_one({"Patient_id": b.get("Patient_id")}) or {}
+        b_copy = dict(b)
+        b_copy["Patient_Name"] = p.get("P_Name", "Unknown Patient")
+        recent_bills.append(b_copy)
 
     # 7. Live analytics: Monthly Appointment Volume (12 months)
     month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     monthly_data = {f"{i:02d}": 0 for i in range(1, 13)}
-    monthly_rows = db.execute(
-        "SELECT substr(A_Date, 6, 2) as m, COUNT(*) as cnt FROM Appointment GROUP BY m ORDER BY m"
-    ).fetchall()
-    for row in monthly_rows:
-        if row["m"] in monthly_data:
-            monthly_data[row["m"]] = row["cnt"]
+    for a in db.appointments.find({}, {"A_Date": 1}):
+        d_str = a.get("A_Date", "")
+        if len(d_str) >= 7 and d_str[4] == "-":
+            m = d_str[5:7]
+            if m in monthly_data:
+                monthly_data[m] += 1
     trend_labels = month_names
     trend_counts = [monthly_data[f"{i:02d}"] for i in range(1, 13)]
 
     # 8. Live analytics: Settlement breakdown by payment mode
-    pay_rows = db.execute(
-        "SELECT Pay_Mode, COUNT(*) as cnt FROM Bill GROUP BY Pay_Mode ORDER BY cnt DESC"
-    ).fetchall()
-    settlement_labels = [r["Pay_Mode"] for r in pay_rows]
-    settlement_counts = [r["cnt"] for r in pay_rows]
+    pay_counts = {}
+    for b in db.bills.find({}, {"Pay_Mode": 1}):
+        m = b.get("Pay_Mode", "Cash")
+        pay_counts[m] = pay_counts.get(m, 0) + 1
+    settlement_labels = list(pay_counts.keys())
+    settlement_counts = list(pay_counts.values())
 
     return render_template(
         "dashboard.html",

@@ -5,7 +5,7 @@ def test_app_creation(app):
     """Test that the application initializes successfully with test config."""
     assert app is not None
     assert app.testing is True
-    assert app.config["DATABASE"].endswith(".db") or app.config["DATABASE"] == ":memory:"
+    assert "MONGO_URI" in app.config
 
 
 def test_index_route(client):

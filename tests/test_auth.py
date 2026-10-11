@@ -1,7 +1,7 @@
 import pytest
 from flask import session, g
 from werkzeug.security import generate_password_hash, check_password_hash
-from app.db import get_db
+from app.db import get_db, get_next_sequence_value
 from app import create_app
 
 
@@ -18,12 +18,10 @@ def test_login_page_renders(client):
 
 def test_unauthenticated_access_redirects(client):
     """Unauthenticated users attempting to access protected routes must be redirected to login."""
-    # Test protected /dashboard route
     res_dashboard = client.get("/dashboard")
     assert res_dashboard.status_code == 302
     assert "/auth/login?next=/dashboard" in res_dashboard.headers["Location"]
 
-    # Test root route
     res_root = client.get("/")
     assert res_root.status_code == 302
     assert "/auth/login" in res_root.headers["Location"]
@@ -40,11 +38,13 @@ def test_login_invalid_credentials(app, client):
     """Submitting incorrect username or password should display generic error message."""
     with app.app_context():
         db = get_db()
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-            ("nurse_joy", generate_password_hash("securepass123"), "Staff"),
-        )
-        db.commit()
+        u_id = get_next_sequence_value(db, "User_ID")
+        db.users.insert_one({
+            "User_ID": u_id,
+            "Username": "nurse_joy",
+            "Password_Hash": generate_password_hash("securepass123"),
+            "Role": "Staff",
+        })
 
     # Wrong password
     res1 = client.post("/auth/login", data={"username": "nurse_joy", "password": "wrongpassword"}, follow_redirects=True)
@@ -61,11 +61,13 @@ def test_login_successful_and_session(app, client):
     """Valid credentials authenticate user, start session, and grant access to dashboard."""
     with app.app_context():
         db = get_db()
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-            ("dr_house", generate_password_hash("vicodin123"), "Doctor"),
-        )
-        db.commit()
+        u_id = get_next_sequence_value(db, "User_ID")
+        db.users.insert_one({
+            "User_ID": u_id,
+            "Username": "dr_house",
+            "Password_Hash": generate_password_hash("vicodin123"),
+            "Role": "Doctor",
+        })
 
     # Perform login
     response = client.post("/auth/login", data={"username": "dr_house", "password": "vicodin123"}, follow_redirects=True)
@@ -85,11 +87,13 @@ def test_open_redirect_protection(app, client):
     """Login next parameter should reject external URLs to prevent open redirect vulnerabilities."""
     with app.app_context():
         db = get_db()
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-            ("safe_user", generate_password_hash("password123"), "Staff"),
-        )
-        db.commit()
+        u_id = get_next_sequence_value(db, "User_ID")
+        db.users.insert_one({
+            "User_ID": u_id,
+            "Username": "safe_user",
+            "Password_Hash": generate_password_hash("password123"),
+            "Role": "Staff",
+        })
 
     # Attempt login with external next URL
     response = client.post(
@@ -97,7 +101,6 @@ def test_open_redirect_protection(app, client):
         data={"username": "safe_user", "password": "password123"},
     )
     assert response.status_code == 302
-    # Must redirect internally to /dashboard, NOT external site
     assert response.headers["Location"].endswith("/dashboard")
 
 
@@ -105,30 +108,27 @@ def test_logout(app, client):
     """POST to /auth/logout clears authenticated session and revokes access to protected routes."""
     with app.app_context():
         db = get_db()
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-            ("admin_test", generate_password_hash("adminpass"), "Admin"),
-        )
-        db.commit()
+        u_id = get_next_sequence_value(db, "User_ID")
+        db.users.insert_one({
+            "User_ID": u_id,
+            "Username": "admin_test",
+            "Password_Hash": generate_password_hash("adminpass"),
+            "Role": "Admin",
+        })
 
-    # Login first
     client.post("/auth/login", data={"username": "admin_test", "password": "adminpass"})
 
-    # Verify session active
     with client.session_transaction() as sess:
         assert sess.get("username") == "admin_test"
 
-    # Logout via POST
     logout_res = client.post("/auth/logout", follow_redirects=True)
     assert logout_res.status_code == 200
     assert b"You have been signed out successfully." in logout_res.data
 
-    # Session must be cleared
     with client.session_transaction() as sess:
         assert "username" not in sess
         assert "user_id" not in sess
 
-    # Access to protected route must be denied
     dash_res = client.get("/dashboard")
     assert dash_res.status_code == 302
     assert "/auth/login" in dash_res.headers["Location"]
@@ -147,25 +147,23 @@ def test_create_admin_cli_command(runner, app):
 
     with app.app_context():
         db = get_db()
-        user = db.execute("SELECT * FROM User WHERE Username = 'superadmin'").fetchone()
+        user = db.users.find_one({"Username": "superadmin"})
         assert user is not None
-        # Password MUST be hashed, never plaintext
         assert user["Password_Hash"] != "AdminSecret99"
         assert check_password_hash(user["Password_Hash"], "AdminSecret99")
         assert user["Role"] == "Admin"
 
-    # Test duplicate creation handling
     dup_result = runner.invoke(args=["create-admin", "--username", "superadmin", "--password", "AnotherPass"])
     assert "Error: A user with username 'superadmin' already exists." in dup_result.output
 
 
-def test_csrf_protection_enforced(tmp_path):
+def test_csrf_protection_enforced():
     """Verify that when CSRF protection is active, POST requests without CSRF token are blocked."""
-    db_file = tmp_path / "csrf_test.db"
     csrf_app = create_app(
         test_config={
             "TESTING": True,
-            "DATABASE": str(db_file),
+            "MONGO_URI": "mongomock://localhost",
+            "MONGO_DB_NAME": "csrf_test_db",
             "WTF_CSRF_ENABLED": True,
             "SECRET_KEY": "test-csrf-secret",
         }
@@ -175,6 +173,5 @@ def test_csrf_protection_enforced(tmp_path):
         init_db()
 
     csrf_client = csrf_app.test_client()
-    # POST without CSRF token should return 400 Bad Request
     response = csrf_client.post("/auth/login", data={"username": "admin", "password": "password"})
     assert response.status_code == 400

@@ -1,4 +1,4 @@
-import sqlite3
+import re
 from datetime import datetime, date
 from flask import (
     Blueprint,
@@ -11,7 +11,7 @@ from flask import (
     url_for,
 )
 from app.auth import login_required
-from app.db import get_db
+from app.db import get_db, get_next_sequence_value
 from app.validators import (
     time_to_minutes,
     minutes_to_time,
@@ -33,65 +33,54 @@ def index():
     filter_date = request.args.get("date", "").strip()
     filter_status = request.args.get("status", "all").strip()
 
-    query = """
-        SELECT 
-            a.Appointment_ID,
-            a.Patient_id,
-            a.Doctor_ID,
-            a.A_Date,
-            a.A_Time,
-            a.Reason,
-            a.Duration_Min,
-            a.Status,
-            a.Created_At,
-            p.P_Name AS Patient_Name,
-            p.Blood_Group,
-            d.D_Name AS Doctor_Name,
-            d.D_Qualification
-        FROM Appointment a
-        JOIN Patient p ON a.Patient_id = p.Patient_id
-        JOIN Doctor d ON a.Doctor_ID = d.Doctor_ID
-        WHERE 1=1
-    """
-    params = []
+    filter_query = {}
 
-    # Search filter (Reason, Patient Name, or Doctor Name)
-    if search:
-        query += " AND (a.Reason LIKE ? OR p.P_Name LIKE ? OR d.D_Name LIKE ?)"
-        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
-
-    # Patient filter
     if filter_patient and filter_patient.isdigit():
-        query += " AND a.Patient_id = ?"
-        params.append(int(filter_patient))
+        filter_query["Patient_id"] = int(filter_patient)
 
-    # Doctor filter
     if filter_doctor and filter_doctor.isdigit():
-        query += " AND a.Doctor_ID = ?"
-        params.append(int(filter_doctor))
+        filter_query["Doctor_ID"] = int(filter_doctor)
 
-    # Date filter
     if filter_date:
-        query += " AND a.A_Date = ?"
-        params.append(filter_date)
+        filter_query["A_Date"] = filter_date
 
-    # Status filter
     if filter_status and filter_status != "all":
-        query += " AND a.Status = ?"
-        params.append(filter_status)
+        filter_query["Status"] = filter_status
 
-    query += " ORDER BY a.A_Date DESC, a.A_Time DESC"
-    appointments = db.execute(query, params).fetchall()
+    raw_appointments = list(db.appointments.find(filter_query).sort([("A_Date", -1), ("A_Time", -1)]))
 
-    # Auxiliary data for filter dropdowns
-    patients = db.execute("SELECT Patient_id, P_Name FROM Patient ORDER BY P_Name").fetchall()
-    doctors = db.execute("SELECT Doctor_ID, D_Name FROM Doctor ORDER BY D_Name").fetchall()
+    # Pre-fetch patients and doctors to efficiently map relations
+    patients_map = {p["Patient_id"]: p for p in db.patients.find({})}
+    doctors_map = {d["Doctor_ID"]: d for d in db.doctors.find({})}
 
-    # Status counts
-    total_count = db.execute("SELECT COUNT(*) FROM Appointment").fetchone()[0]
-    scheduled_count = db.execute("SELECT COUNT(*) FROM Appointment WHERE Status = 'Scheduled'").fetchone()[0]
-    completed_count = db.execute("SELECT COUNT(*) FROM Appointment WHERE Status = 'Completed'").fetchone()[0]
-    cancelled_count = db.execute("SELECT COUNT(*) FROM Appointment WHERE Status = 'Cancelled'").fetchone()[0]
+    appointments = []
+    for a in raw_appointments:
+        p = patients_map.get(a.get("Patient_id"), {})
+        d = doctors_map.get(a.get("Doctor_ID"), {})
+        a_copy = dict(a)
+        a_copy["Patient_Name"] = p.get("P_Name", "Unknown Patient")
+        a_copy["Blood_Group"] = p.get("Blood_Group", "-")
+        a_copy["Doctor_Name"] = d.get("D_Name", "Unknown Doctor")
+        a_copy["D_Qualification"] = d.get("D_Qualification", "")
+
+        # In-memory search filter if search string was provided
+        if search:
+            search_lower = search.lower()
+            reason = str(a_copy.get("Reason", "")).lower()
+            p_name = a_copy["Patient_Name"].lower()
+            d_name = a_copy["Doctor_Name"].lower()
+            if search_lower not in reason and search_lower not in p_name and search_lower not in d_name:
+                continue
+
+        appointments.append(a_copy)
+
+    patients = list(db.patients.find({}, {"Patient_id": 1, "P_Name": 1}).sort("P_Name", 1))
+    doctors = list(db.doctors.find({}, {"Doctor_ID": 1, "D_Name": 1}).sort("D_Name", 1))
+
+    total_count = db.appointments.count_documents({})
+    scheduled_count = db.appointments.count_documents({"Status": "Scheduled"})
+    completed_count = db.appointments.count_documents({"Status": "Completed"})
+    cancelled_count = db.appointments.count_documents({"Status": "Cancelled"})
 
     return render_template(
         "appointments/index.html",
@@ -130,39 +119,29 @@ def create():
 
         errors = []
 
-        # 1. Patient verification
         patient = None
         if not patient_id_raw or not patient_id_raw.isdigit():
             errors.append("Please select a valid patient.")
         else:
-            patient = db.execute(
-                "SELECT Patient_id, P_Name, is_active FROM Patient WHERE Patient_id = ?",
-                (int(patient_id_raw),),
-            ).fetchone()
+            patient = db.patients.find_one({"Patient_id": int(patient_id_raw)})
             if not patient:
                 errors.append("The selected patient does not exist.")
 
-        # 2. Doctor verification (must be active)
         doctor = None
         if not doctor_id_raw or not doctor_id_raw.isdigit():
             errors.append("Please select a valid doctor.")
         else:
-            doctor = db.execute(
-                "SELECT Doctor_ID, D_Name, is_active FROM Doctor WHERE Doctor_ID = ?",
-                (int(doctor_id_raw),),
-            ).fetchone()
+            doctor = db.doctors.find_one({"Doctor_ID": int(doctor_id_raw)})
             if not doctor:
                 errors.append("The selected doctor does not exist.")
-            elif doctor["is_active"] != 1:
+            elif doctor.get("is_active") != 1:
                 errors.append(f"Dr. {doctor['D_Name']} is currently inactive/off-duty and cannot accept new appointments.")
 
-        # 3. Reason validation
         if not reason:
             errors.append("Please enter the clinical reason for the appointment.")
         elif len(reason) > 250:
             errors.append("Reason must be 250 characters or less.")
 
-        # 4. Duration validation
         duration = default_duration
         if duration_raw:
             try:
@@ -172,7 +151,6 @@ def create():
             except ValueError:
                 errors.append("Duration must be a valid number.")
 
-        # 5. Date validation (must not be in the past)
         if not date_str:
             errors.append("Please select an appointment date.")
         else:
@@ -183,7 +161,6 @@ def create():
             except ValueError:
                 errors.append("Date must be in YYYY-MM-DD format.")
 
-        # 6. Time and Clinic Hours validation
         start_min = time_to_minutes(time_str)
         if start_min is None:
             errors.append("Please enter a valid appointment time in HH:MM format.")
@@ -199,7 +176,6 @@ def create():
                     f"Appointment ({time_str} to {minutes_to_time(end_min)}) extends beyond clinic closing hours ({clinic_close})."
                 )
 
-        # 7. Doctor Overlap Conflict Check
         if not errors and doctor and start_min is not None:
             has_conflict, conflict = check_appointment_overlap(
                 db, int(doctor_id_raw), date_str, start_min, start_min + duration
@@ -212,17 +188,20 @@ def create():
                     f"Please choose another time slot or another doctor."
                 )
 
-        # 8. Database Transaction Execution
         if not errors:
             try:
-                cur = db.execute(
-                    """INSERT INTO Appointment 
-                       (Patient_id, Doctor_ID, A_Date, A_Time, Reason, Duration_Min, Status)
-                       VALUES (?, ?, ?, ?, ?, ?, 'Scheduled')""",
-                    (int(patient_id_raw), int(doctor_id_raw), date_str, time_str, reason, duration),
-                )
-                db.commit()
-                new_appt_id = cur.lastrowid
+                new_appt_id = get_next_sequence_value(db, "Appointment_ID")
+                db.appointments.insert_one({
+                    "Appointment_ID": new_appt_id,
+                    "Patient_id": int(patient_id_raw),
+                    "Doctor_ID": int(doctor_id_raw),
+                    "A_Date": date_str,
+                    "A_Time": time_str,
+                    "Reason": reason,
+                    "Duration_Min": duration,
+                    "Status": "Scheduled",
+                    "Created_At": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
                 doc_title = doctor["D_Name"] if doctor["D_Name"].startswith("Dr.") else f"Dr. {doctor['D_Name']}"
                 flash(
                     f"Appointment #{new_appt_id} scheduled successfully for {patient['P_Name']} "
@@ -230,17 +209,15 @@ def create():
                     "success",
                 )
                 return redirect(url_for("appointments.detail", appointment_id=new_appt_id))
-            except sqlite3.Error as e:
+            except Exception as e:
                 flash(f"Database error creating appointment: {e}", "danger")
         else:
             for error in errors:
                 flash(error, "danger")
 
-    # Fetch active patients and active doctors for dropdowns
-    active_patients = db.execute("SELECT Patient_id, P_Name, Blood_Group FROM Patient WHERE is_active = 1 ORDER BY P_Name").fetchall()
-    active_doctors = db.execute("SELECT Doctor_ID, D_Name, D_Qualification FROM Doctor WHERE is_active = 1 ORDER BY D_Name").fetchall()
+    active_patients = list(db.patients.find({"is_active": 1}).sort("P_Name", 1))
+    active_doctors = list(db.doctors.find({"is_active": 1}).sort("D_Name", 1))
 
-    # Pre-select IDs if passed in query params
     pre_patient = request.args.get("patient_id", "")
     pre_doctor = request.args.get("doctor_id", "")
 
@@ -261,31 +238,25 @@ def create():
 def detail(appointment_id):
     """View appointment record details, participants, and status management actions."""
     db = get_db()
-    appointment = db.execute(
-        """
-        SELECT 
-            a.*,
-            p.P_Name AS Patient_Name,
-            p.P_Age,
-            p.P_Gender,
-            p.Blood_Group,
-            d.D_Name AS Doctor_Name,
-            d.D_Qualification,
-            d.D_Phone AS Doctor_Phone
-        FROM Appointment a
-        JOIN Patient p ON a.Patient_id = p.Patient_id
-        JOIN Doctor d ON a.Doctor_ID = d.Doctor_ID
-        WHERE a.Appointment_ID = ?
-        """,
-        (appointment_id,),
-    ).fetchone()
-
-    if appointment is None:
+    raw_appointment = db.appointments.find_one({"Appointment_ID": appointment_id})
+    if raw_appointment is None:
         flash(f"Appointment #{appointment_id} not found.", "warning")
         return redirect(url_for("appointments.index"))
 
-    start_min = time_to_minutes(appointment["A_Time"])
-    end_time = minutes_to_time(start_min + appointment["Duration_Min"]) if start_min else "N/A"
+    patient = db.patients.find_one({"Patient_id": raw_appointment.get("Patient_id")}) or {}
+    doctor = db.doctors.find_one({"Doctor_ID": raw_appointment.get("Doctor_ID")}) or {}
+
+    appointment = dict(raw_appointment)
+    appointment["Patient_Name"] = patient.get("P_Name", "Unknown Patient")
+    appointment["P_Age"] = patient.get("P_Age", "-")
+    appointment["P_Gender"] = patient.get("P_Gender", "-")
+    appointment["Blood_Group"] = patient.get("Blood_Group", "-")
+    appointment["Doctor_Name"] = doctor.get("D_Name", "Unknown Doctor")
+    appointment["D_Qualification"] = doctor.get("D_Qualification", "")
+    appointment["Doctor_Phone"] = doctor.get("D_Phone", "")
+
+    start_min = time_to_minutes(appointment.get("A_Time"))
+    end_time = minutes_to_time(start_min + appointment.get("Duration_Min", 30)) if start_min else "N/A"
 
     return render_template(
         "appointments/detail.html",
@@ -299,7 +270,7 @@ def detail(appointment_id):
 def edit(appointment_id):
     """Reschedule or edit appointment details with self-exclusion from conflict check."""
     db = get_db()
-    appointment = db.execute("SELECT * FROM Appointment WHERE Appointment_ID = ?", (appointment_id,)).fetchone()
+    appointment = db.appointments.find_one({"Appointment_ID": appointment_id})
     if appointment is None:
         flash(f"Appointment #{appointment_id} not found.", "warning")
         return redirect(url_for("appointments.index"))
@@ -313,27 +284,24 @@ def edit(appointment_id):
         date_str = request.form.get("date", "").strip()
         time_str = request.form.get("time", "").strip()
         reason = request.form.get("reason", "").strip()
-        duration_raw = request.form.get("duration", str(appointment["Duration_Min"])).strip()
-        status = request.form.get("status", appointment["Status"]).strip()
+        duration_raw = request.form.get("duration", str(appointment.get("Duration_Min", default_duration))).strip()
+        status = request.form.get("status", appointment.get("Status")).strip()
 
         errors = []
 
-        # Doctor verification
         doctor = None
         if not doctor_id_raw or not doctor_id_raw.isdigit():
             errors.append("Please select a valid doctor.")
         else:
-            doctor = db.execute("SELECT Doctor_ID, D_Name, is_active FROM Doctor WHERE Doctor_ID = ?", (int(doctor_id_raw),)).fetchone()
+            doctor = db.doctors.find_one({"Doctor_ID": int(doctor_id_raw)})
             if not doctor:
                 errors.append("The selected doctor does not exist.")
 
-        # Reason
         if not reason:
             errors.append("Please enter the clinical reason.")
         elif len(reason) > 250:
             errors.append("Reason must be 250 characters or less.")
 
-        # Duration
         duration = default_duration
         if duration_raw:
             try:
@@ -343,7 +311,6 @@ def edit(appointment_id):
             except ValueError:
                 errors.append("Duration must be a valid number.")
 
-        # Date
         if not date_str:
             errors.append("Please select a date.")
         else:
@@ -352,7 +319,6 @@ def edit(appointment_id):
             except ValueError:
                 errors.append("Date must be in YYYY-MM-DD format.")
 
-        # Time and Clinic Hours
         start_min = time_to_minutes(time_str)
         if start_min is None:
             errors.append("Please enter a valid time in HH:MM format.")
@@ -364,7 +330,6 @@ def edit(appointment_id):
             if start_min < open_min or end_min > close_min:
                 errors.append(f"Appointment must fall within clinic hours ({clinic_open} to {clinic_close}).")
 
-        # Conflict check - excluding this appointment itself
         if not errors and doctor and start_min is not None and status != "Cancelled":
             has_conflict, conflict = check_appointment_overlap(
                 db, int(doctor_id_raw), date_str, start_min, start_min + duration, exclude_appointment_id=appointment_id
@@ -378,27 +343,29 @@ def edit(appointment_id):
 
         if not errors:
             try:
-                db.execute(
-                    """UPDATE Appointment
-                       SET Doctor_ID = ?, A_Date = ?, A_Time = ?, Reason = ?, Duration_Min = ?, Status = ?
-                       WHERE Appointment_ID = ?""",
-                    (int(doctor_id_raw), date_str, time_str, reason, duration, status, appointment_id),
+                db.appointments.update_one(
+                    {"Appointment_ID": appointment_id},
+                    {"$set": {
+                        "Doctor_ID": int(doctor_id_raw),
+                        "A_Date": date_str,
+                        "A_Time": time_str,
+                        "Reason": reason,
+                        "Duration_Min": duration,
+                        "Status": status,
+                    }}
                 )
-                db.commit()
                 flash(f"Appointment #{appointment_id} updated successfully.", "success")
                 return redirect(url_for("appointments.detail", appointment_id=appointment_id))
-            except sqlite3.Error as e:
+            except Exception as e:
                 flash(f"Database error updating appointment: {e}", "danger")
         else:
             for error in errors:
                 flash(error, "danger")
 
-    # Fetch active doctors for reassignment, including the currently assigned doctor even if inactive
-    doctors = db.execute(
-        "SELECT Doctor_ID, D_Name, D_Qualification FROM Doctor WHERE is_active = 1 OR Doctor_ID = ? ORDER BY D_Name",
-        (appointment["Doctor_ID"],),
-    ).fetchall()
-    patient = db.execute("SELECT Patient_id, P_Name FROM Patient WHERE Patient_id = ?", (appointment["Patient_id"],)).fetchone()
+    doctors = list(db.doctors.find({
+        "$or": [{"is_active": 1}, {"Doctor_ID": appointment.get("Doctor_ID")}]
+    }).sort("D_Name", 1))
+    patient = db.patients.find_one({"Patient_id": appointment.get("Patient_id")})
 
     return render_template(
         "appointments/edit.html",
@@ -416,13 +383,12 @@ def edit(appointment_id):
 def cancel(appointment_id):
     """Cancel appointment. Cancelled appointments release the slot for other bookings."""
     db = get_db()
-    appt = db.execute("SELECT Appointment_ID, Status FROM Appointment WHERE Appointment_ID = ?", (appointment_id,)).fetchone()
+    appt = db.appointments.find_one({"Appointment_ID": appointment_id})
     if not appt:
         flash(f"Appointment #{appointment_id} not found.", "warning")
         return redirect(url_for("appointments.index"))
 
-    db.execute("UPDATE Appointment SET Status = 'Cancelled' WHERE Appointment_ID = ?", (appointment_id,))
-    db.commit()
+    db.appointments.update_one({"Appointment_ID": appointment_id}, {"$set": {"Status": "Cancelled"}})
     flash(f"Appointment #{appointment_id} has been cancelled. The time slot is now available for other bookings.", "info")
     return redirect(request.referrer or url_for("appointments.detail", appointment_id=appointment_id))
 
@@ -432,12 +398,11 @@ def cancel(appointment_id):
 def complete(appointment_id):
     """Mark appointment as completed."""
     db = get_db()
-    appt = db.execute("SELECT Appointment_ID FROM Appointment WHERE Appointment_ID = ?", (appointment_id,)).fetchone()
+    appt = db.appointments.find_one({"Appointment_ID": appointment_id})
     if not appt:
         flash(f"Appointment #{appointment_id} not found.", "warning")
         return redirect(url_for("appointments.index"))
 
-    db.execute("UPDATE Appointment SET Status = 'Completed' WHERE Appointment_ID = ?", (appointment_id,))
-    db.commit()
+    db.appointments.update_one({"Appointment_ID": appointment_id}, {"$set": {"Status": "Completed"}})
     flash(f"Appointment #{appointment_id} marked as completed.", "success")
     return redirect(request.referrer or url_for("appointments.detail", appointment_id=appointment_id))

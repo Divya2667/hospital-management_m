@@ -13,14 +13,9 @@ class Config:
     """Base configuration class."""
     SECRET_KEY = os.environ.get("SECRET_KEY", "dev-fallback-key-hospital-mgmt-academic-2025")
     
-    # Instance directory for SQLite database storage
-    # On Vercel, serverless containers are read-only except /tmp
-    if os.environ.get("VERCEL"):
-        INSTANCE_PATH = Path("/tmp")
-        DATABASE = os.environ.get("DATABASE", "/tmp/hospital.db")
-    else:
-        INSTANCE_PATH = BASE_DIR / "instance"
-        DATABASE = os.environ.get("DATABASE", str(INSTANCE_PATH / "hospital.db"))
+    # MongoDB Connection Settings
+    MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/hospital_management")
+    MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "hospital_management")
 
     # Clinic Scheduling Settings
     CLINIC_OPEN_TIME = os.environ.get("CLINIC_OPEN_TIME", "09:00")
@@ -41,11 +36,12 @@ class DevelopmentConfig(Config):
 
 
 class TestingConfig(Config):
-    """Testing configuration with in-memory or isolated test database."""
+    """Testing configuration with in-memory isolated test database."""
     DEBUG = False
     TESTING = True
     WTF_CSRF_ENABLED = False  # Simplify automated client testing
-    DATABASE = ":memory:"
+    MONGO_URI = "mongomock://localhost"
+    MONGO_DB_NAME = "hospital_management_test"
 
 
 class ProductionConfig(Config):

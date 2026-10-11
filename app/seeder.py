@@ -24,7 +24,6 @@ def find_dataset_dir(custom_path=None):
     if custom_path:
         candidates.append(Path(custom_path))
 
-    # Project root dataset
     current_file = Path(__file__).resolve()
     project_root = current_file.parent.parent
     candidates.append(project_root / "dataset")
@@ -37,10 +36,7 @@ def find_dataset_dir(custom_path=None):
 
 
 def import_csv_dataset(db, dataset_dir=None):
-    """Import records from dataset CSV files into the SQLite database.
-    
-    Returns a dict summary of imported row counts.
-    """
+    """Import records from dataset CSV files into MongoDB collections."""
     data_dir = find_dataset_dir(dataset_dir)
     if not data_dir:
         raise FileNotFoundError(f"Could not locate dataset folder. Searched candidates from {Path.cwd()}")
@@ -54,8 +50,11 @@ def import_csv_dataset(db, dataset_dir=None):
         "admin_created": False,
     }
 
-    # Ensure foreign keys are enabled
-    db.execute("PRAGMA foreign_keys = ON;")
+    max_p_id = 0
+    max_d_id = 0
+    max_a_id = 0
+    max_b_id = 0
+    max_t_id = 0
 
     # 1. Patients
     patients_file = data_dir / "patients.csv"
@@ -67,32 +66,30 @@ def import_csv_dataset(db, dataset_dir=None):
                 if not p_raw_id:
                     continue
                 patient_id = int(p_raw_id.replace("P", "").lstrip("0") or "0")
+                max_p_id = max(max_p_id, patient_id)
                 first = row.get("first_name", "").strip()
                 last = row.get("last_name", "").strip()
                 name = f"{first} {last}".strip() or f"Patient {patient_id}"
 
                 dob = row.get("date_of_birth", "").strip()
                 birth_year = int(dob[:4]) if dob and len(dob) >= 4 and dob[:4].isdigit() else 1985
-                # Hospital local reference year 2026
                 age = max(0, min(120, 2026 - birth_year))
 
                 raw_gender = row.get("gender", "").strip().upper()
                 gender = "Male" if raw_gender == "M" else ("Female" if raw_gender == "F" else "Other")
-
                 blood_group = BLOOD_GROUPS[(patient_id - 1) % len(BLOOD_GROUPS)]
 
-                db.execute(
-                    """
-                    INSERT INTO Patient (Patient_id, P_Name, P_Age, P_Gender, Blood_Group, is_active)
-                    VALUES (?, ?, ?, ?, ?, 1)
-                    ON CONFLICT(Patient_id) DO UPDATE SET
-                        P_Name = excluded.P_Name,
-                        P_Age = excluded.P_Age,
-                        P_Gender = excluded.P_Gender,
-                        Blood_Group = excluded.Blood_Group,
-                        is_active = 1
-                    """,
-                    (patient_id, name, age, gender, blood_group),
+                db.patients.update_one(
+                    {"Patient_id": patient_id},
+                    {"$set": {
+                        "Patient_id": patient_id,
+                        "P_Name": name,
+                        "P_Age": age,
+                        "P_Gender": gender,
+                        "Blood_Group": blood_group,
+                        "is_active": 1,
+                    }},
+                    upsert=True
                 )
                 stats["patients"] += 1
 
@@ -106,6 +103,7 @@ def import_csv_dataset(db, dataset_dir=None):
                 if not d_raw_id:
                     continue
                 doctor_id = int(d_raw_id.replace("D", "").lstrip("0") or "0")
+                max_d_id = max(max_d_id, doctor_id)
                 first = row.get("first_name", "").strip()
                 last = row.get("last_name", "").strip()
                 name = f"Dr. {first} {last}".strip()
@@ -115,18 +113,17 @@ def import_csv_dataset(db, dataset_dir=None):
                 exp = int(row.get("years_experience", 5))
                 phone = row.get("phone_number", "555-0100").strip()
 
-                db.execute(
-                    """
-                    INSERT INTO Doctor (Doctor_ID, D_Name, D_Qualification, Experience, D_Phone, is_active)
-                    VALUES (?, ?, ?, ?, ?, 1)
-                    ON CONFLICT(Doctor_ID) DO UPDATE SET
-                        D_Name = excluded.D_Name,
-                        D_Qualification = excluded.D_Qualification,
-                        Experience = excluded.Experience,
-                        D_Phone = excluded.D_Phone,
-                        is_active = 1
-                    """,
-                    (doctor_id, name, qual, exp, phone),
+                db.doctors.update_one(
+                    {"Doctor_ID": doctor_id},
+                    {"$set": {
+                        "Doctor_ID": doctor_id,
+                        "D_Name": name,
+                        "D_Qualification": qual,
+                        "Experience": exp,
+                        "D_Phone": phone,
+                        "is_active": 1,
+                    }},
+                    upsert=True
                 )
                 stats["doctors"] += 1
 
@@ -140,6 +137,7 @@ def import_csv_dataset(db, dataset_dir=None):
                 if not a_raw_id:
                     continue
                 appt_id = int(a_raw_id.replace("A", "").lstrip("0") or "0")
+                max_a_id = max(max_a_id, appt_id)
                 p_id = int(row.get("patient_id", "P1").replace("P", "").lstrip("0") or "1")
                 d_id = int(row.get("doctor_id", "D1").replace("D", "").lstrip("0") or "1")
                 a_date = row.get("appointment_date", "").strip()
@@ -155,30 +153,25 @@ def import_csv_dataset(db, dataset_dir=None):
                 else:
                     status = "Scheduled"
 
-                db.execute(
-                    """
-                    INSERT INTO Appointment (Appointment_ID, Patient_id, Doctor_ID, A_Date, A_Time, Reason, Duration_Min, Status)
-                    VALUES (?, ?, ?, ?, ?, ?, 30, ?)
-                    ON CONFLICT(Appointment_ID) DO UPDATE SET
-                        Patient_id = excluded.Patient_id,
-                        Doctor_ID = excluded.Doctor_ID,
-                        A_Date = excluded.A_Date,
-                        A_Time = excluded.A_Time,
-                        Reason = excluded.Reason,
-                        Duration_Min = 30,
-                        Status = excluded.Status
-                    """,
-                    (appt_id, p_id, d_id, a_date, a_time, reason, status),
+                db.appointments.update_one(
+                    {"Appointment_ID": appt_id},
+                    {"$set": {
+                        "Appointment_ID": appt_id,
+                        "Patient_id": p_id,
+                        "Doctor_ID": d_id,
+                        "A_Date": a_date,
+                        "A_Time": a_time,
+                        "Reason": reason,
+                        "Duration_Min": 30,
+                        "Status": status,
+                    }},
+                    upsert=True
                 )
                 stats["appointments"] += 1
 
-    # 4. Treatments (if Treatment table is present)
+    # 4. Treatments
     treatments_file = data_dir / "treatments.csv"
-    has_treatment_table = db.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='Treatment'"
-    ).fetchone() is not None
-
-    if treatments_file.exists() and has_treatment_table:
+    if treatments_file.exists():
         with open(treatments_file, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -186,24 +179,24 @@ def import_csv_dataset(db, dataset_dir=None):
                 if not t_raw_id:
                     continue
                 t_id = int(t_raw_id.replace("T", "").lstrip("0") or "0")
+                max_t_id = max(max_t_id, t_id)
                 a_id = int(row.get("appointment_id", "A1").replace("A", "").lstrip("0") or "1")
                 t_type = row.get("treatment_type", "General").strip()
                 desc = row.get("description", "").strip()
                 cost = float(row.get("cost", 0.0))
                 t_date = row.get("treatment_date", "").strip()
 
-                db.execute(
-                    """
-                    INSERT INTO Treatment (Treatment_ID, Appointment_ID, Treatment_Type, Description, Cost, Treatment_Date)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(Treatment_ID) DO UPDATE SET
-                        Appointment_ID = excluded.Appointment_ID,
-                        Treatment_Type = excluded.Treatment_Type,
-                        Description = excluded.Description,
-                        Cost = excluded.Cost,
-                        Treatment_Date = excluded.Treatment_Date
-                    """,
-                    (t_id, a_id, t_type, desc, cost, t_date),
+                db.treatments.update_one(
+                    {"Treatment_ID": t_id},
+                    {"$set": {
+                        "Treatment_ID": t_id,
+                        "Appointment_ID": a_id,
+                        "Treatment_Type": t_type,
+                        "Description": desc,
+                        "Cost": cost,
+                        "Treatment_Date": t_date,
+                    }},
+                    upsert=True
                 )
                 stats["treatments"] += 1
 
@@ -217,34 +210,45 @@ def import_csv_dataset(db, dataset_dir=None):
                 if not b_raw_id:
                     continue
                 bill_id = int(b_raw_id.replace("B", "").lstrip("0") or "0")
+                max_b_id = max(max_b_id, bill_id)
                 p_id = int(row.get("patient_id", "P1").replace("P", "").lstrip("0") or "1")
                 b_date = row.get("bill_date", "").strip()
                 amount = float(row.get("amount", 100.0))
                 raw_pay = row.get("payment_method", "Cash").strip()
                 pay_mode = PAYMENT_MODE_MAP.get(raw_pay, "Cash")
 
-                db.execute(
-                    """
-                    INSERT INTO Bill (Bill_ID, Patient_id, B_Date, B_Amount, Pay_Mode)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(Bill_ID) DO UPDATE SET
-                        Patient_id = excluded.Patient_id,
-                        B_Date = excluded.B_Date,
-                        B_Amount = excluded.B_Amount,
-                        Pay_Mode = excluded.Pay_Mode
-                    """,
-                    (bill_id, p_id, b_date, amount, pay_mode),
+                db.bills.update_one(
+                    {"Bill_ID": bill_id},
+                    {"$set": {
+                        "Bill_ID": bill_id,
+                        "Patient_id": p_id,
+                        "B_Date": b_date,
+                        "B_Amount": amount,
+                        "Pay_Mode": pay_mode,
+                    }},
+                    upsert=True
                 )
                 stats["bills"] += 1
 
-    # 6. Ensure Default Administrator
-    admin = db.execute("SELECT User_ID FROM User WHERE Username = 'admin'").fetchone()
+    # 6. Synchronize ID Counters
+    db.counters.update_one({"_id": "Patient_id"}, {"$max": {"seq": max_p_id}}, upsert=True)
+    db.counters.update_one({"_id": "Doctor_ID"}, {"$max": {"seq": max_d_id}}, upsert=True)
+    db.counters.update_one({"_id": "Appointment_ID"}, {"$max": {"seq": max_a_id}}, upsert=True)
+    db.counters.update_one({"_id": "Treatment_ID"}, {"$max": {"seq": max_t_id}}, upsert=True)
+    db.counters.update_one({"_id": "Bill_ID"}, {"$max": {"seq": max_b_id}}, upsert=True)
+
+    # 7. Ensure Default Administrator
+    admin = db.users.find_one({"Username": "admin"})
     if not admin:
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, 'Admin')",
-            ("admin", generate_password_hash("admin123")),
-        )
+        db.users.insert_one({
+            "User_ID": 1,
+            "Username": "admin",
+            "Password_Hash": generate_password_hash("Admin@123"),
+            "Role": "Admin",
+            "Full_Name": "System Administrator",
+            "Email": "admin@hospital.local",
+        })
+        db.counters.update_one({"_id": "User_ID"}, {"$max": {"seq": 1}}, upsert=True)
         stats["admin_created"] = True
 
-    db.commit()
     return stats

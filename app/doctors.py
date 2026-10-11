@@ -1,4 +1,5 @@
-import sqlite3
+import re
+from datetime import datetime
 from flask import (
     Blueprint,
     flash,
@@ -9,7 +10,7 @@ from flask import (
     url_for,
 )
 from app.auth import login_required
-from app.db import get_db
+from app.db import get_db, get_next_sequence_value
 from app.validators import validate_doctor
 
 bp = Blueprint("doctors", __name__, url_prefix="/doctors")
@@ -23,30 +24,31 @@ def index():
     search = request.args.get("search", "").strip()
     status_filter = request.args.get("status", "all").strip().lower()
 
-    query = "SELECT * FROM Doctor WHERE 1=1"
-    params = []
+    query = {}
 
-    # Search filter
     if search:
+        regex = {"$regex": re.escape(search), "$options": "i"}
         if search.isdigit():
-            query += " AND (Doctor_ID = ? OR D_Name LIKE ? OR D_Qualification LIKE ?)"
-            params.extend([int(search), f"%{search}%", f"%{search}%"])
+            query["$or"] = [
+                {"Doctor_ID": int(search)},
+                {"D_Name": regex},
+                {"D_Qualification": regex},
+            ]
         else:
-            query += " AND (D_Name LIKE ? OR D_Qualification LIKE ?)"
-            params.extend([f"%{search}%", f"%{search}%"])
+            query["$or"] = [
+                {"D_Name": regex},
+                {"D_Qualification": regex},
+            ]
 
-    # Status filter
     if status_filter == "active":
-        query += " AND is_active = 1"
+        query["is_active"] = 1
     elif status_filter == "inactive":
-        query += " AND is_active = 0"
+        query["is_active"] = 0
 
-    query += " ORDER BY Doctor_ID DESC"
-    doctors = db.execute(query, params).fetchall()
+    doctors = list(db.doctors.find(query).sort("Doctor_ID", -1))
 
-    # Total counts for filter pills
-    active_count = db.execute("SELECT COUNT(*) FROM Doctor WHERE is_active = 1").fetchone()[0]
-    total_count = db.execute("SELECT COUNT(*) FROM Doctor").fetchone()[0]
+    total_count = db.doctors.count_documents({})
+    active_count = db.doctors.count_documents({"is_active": 1})
     inactive_count = total_count - active_count
 
     return render_template(
@@ -73,32 +75,26 @@ def create():
         errors, cleaned_data = validate_doctor(name, qualification, experience_str, phone)
 
         db = get_db()
-        # Graceful check for duplicate phone number
         if not errors:
-            existing = db.execute(
-                "SELECT Doctor_ID, D_Name FROM Doctor WHERE D_Phone = ?",
-                (cleaned_data["D_Phone"],),
-            ).fetchone()
+            existing = db.doctors.find_one({"D_Phone": cleaned_data["D_Phone"]})
             if existing:
                 errors.append(f"Phone number is already associated with Dr. {existing['D_Name']} (ID: #{existing['Doctor_ID']}).")
 
         if not errors:
             try:
-                cur = db.execute(
-                    """INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone, is_active)
-                       VALUES (?, ?, ?, ?, 1)""",
-                    (
-                        cleaned_data["D_Name"],
-                        cleaned_data["D_Qualification"],
-                        cleaned_data["Experience"],
-                        cleaned_data["D_Phone"],
-                    ),
-                )
-                db.commit()
-                new_doctor_id = cur.lastrowid
+                new_doctor_id = get_next_sequence_value(db, "Doctor_ID")
+                db.doctors.insert_one({
+                    "Doctor_ID": new_doctor_id,
+                    "D_Name": cleaned_data["D_Name"],
+                    "D_Qualification": cleaned_data["D_Qualification"],
+                    "Experience": cleaned_data["Experience"],
+                    "D_Phone": cleaned_data["D_Phone"],
+                    "is_active": 1,
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
                 flash(f"Doctor '{cleaned_data['D_Name']}' (ID: #{new_doctor_id}) registered successfully.", "success")
                 return redirect(url_for("doctors.detail", doctor_id=new_doctor_id))
-            except sqlite3.Error as e:
+            except Exception as e:
                 flash(f"Database error registering doctor: {e}", "danger")
         else:
             for error in errors:
@@ -112,35 +108,22 @@ def create():
 def detail(doctor_id):
     """View doctor profile details and their assigned clinical appointments."""
     db = get_db()
-    doctor = db.execute("SELECT * FROM Doctor WHERE Doctor_ID = ?", (doctor_id,)).fetchone()
+    doctor = db.doctors.find_one({"Doctor_ID": doctor_id})
     if doctor is None:
         flash(f"Doctor #{doctor_id} was not found.", "warning")
         return redirect(url_for("doctors.index"))
 
-    # Appointments assigned to this doctor with Patient details
-    appointments = db.execute(
-        """
-        SELECT 
-            a.Appointment_ID,
-            a.A_Date,
-            a.A_Time,
-            a.Reason,
-            a.Duration_Min,
-            a.Status,
-            a.Created_At,
-            p.Patient_id,
-            p.P_Name AS Patient_Name,
-            p.Blood_Group
-        FROM Appointment a
-        JOIN Patient p ON a.Patient_id = p.Patient_id
-        WHERE a.Doctor_ID = ?
-        ORDER BY a.A_Date DESC, a.A_Time DESC
-        """,
-        (doctor_id,),
-    ).fetchall()
+    raw_appts = list(db.appointments.find({"Doctor_ID": doctor_id}).sort([("A_Date", -1), ("A_Time", -1)]))
+    appointments = []
+    for a in raw_appts:
+        patient = db.patients.find_one({"Patient_id": a.get("Patient_id")}) or {}
+        a_copy = dict(a)
+        a_copy["Patient_Name"] = patient.get("P_Name", "Unknown Patient")
+        a_copy["Blood_Group"] = patient.get("Blood_Group", "-")
+        appointments.append(a_copy)
 
-    scheduled_count = sum(1 for a in appointments if a["Status"] == "Scheduled")
-    completed_count = sum(1 for a in appointments if a["Status"] == "Completed")
+    scheduled_count = sum(1 for a in appointments if a.get("Status") == "Scheduled")
+    completed_count = sum(1 for a in appointments if a.get("Status") == "Completed")
 
     return render_template(
         "doctors/detail.html",
@@ -156,7 +139,7 @@ def detail(doctor_id):
 def edit(doctor_id):
     """Edit doctor information."""
     db = get_db()
-    doctor = db.execute("SELECT * FROM Doctor WHERE Doctor_ID = ?", (doctor_id,)).fetchone()
+    doctor = db.doctors.find_one({"Doctor_ID": doctor_id})
     if doctor is None:
         flash(f"Doctor #{doctor_id} was not found.", "warning")
         return redirect(url_for("doctors.index"))
@@ -169,33 +152,28 @@ def edit(doctor_id):
 
         errors, cleaned_data = validate_doctor(name, qualification, experience_str, phone)
 
-        # Check duplicate phone for other doctors
         if not errors:
-            duplicate = db.execute(
-                "SELECT Doctor_ID, D_Name FROM Doctor WHERE D_Phone = ? AND Doctor_ID != ?",
-                (cleaned_data["D_Phone"], doctor_id),
-            ).fetchone()
+            duplicate = db.doctors.find_one({
+                "D_Phone": cleaned_data["D_Phone"],
+                "Doctor_ID": {"$ne": doctor_id}
+            })
             if duplicate:
                 errors.append(f"Phone number is already associated with Dr. {duplicate['D_Name']} (ID: #{duplicate['Doctor_ID']}).")
 
         if not errors:
             try:
-                db.execute(
-                    """UPDATE Doctor
-                       SET D_Name = ?, D_Qualification = ?, Experience = ?, D_Phone = ?
-                       WHERE Doctor_ID = ?""",
-                    (
-                        cleaned_data["D_Name"],
-                        cleaned_data["D_Qualification"],
-                        cleaned_data["Experience"],
-                        cleaned_data["D_Phone"],
-                        doctor_id,
-                    ),
+                db.doctors.update_one(
+                    {"Doctor_ID": doctor_id},
+                    {"$set": {
+                        "D_Name": cleaned_data["D_Name"],
+                        "D_Qualification": cleaned_data["D_Qualification"],
+                        "Experience": cleaned_data["Experience"],
+                        "D_Phone": cleaned_data["D_Phone"],
+                    }}
                 )
-                db.commit()
                 flash(f"Doctor #{doctor_id} updated successfully.", "success")
                 return redirect(url_for("doctors.detail", doctor_id=doctor_id))
-            except sqlite3.Error as e:
+            except Exception as e:
                 flash(f"Database error updating doctor: {e}", "danger")
         else:
             for error in errors:
@@ -209,17 +187,17 @@ def edit(doctor_id):
 def toggle_status(doctor_id):
     """Toggle doctor active / inactive on-duty status."""
     db = get_db()
-    doctor = db.execute("SELECT Doctor_ID, D_Name, is_active FROM Doctor WHERE Doctor_ID = ?", (doctor_id,)).fetchone()
+    doctor = db.doctors.find_one({"Doctor_ID": doctor_id})
     if doctor is None:
         flash(f"Doctor #{doctor_id} not found.", "warning")
         return redirect(url_for("doctors.index"))
 
-    new_status = 0 if doctor["is_active"] == 1 else 1
-    db.execute("UPDATE Doctor SET is_active = ? WHERE Doctor_ID = ?", (new_status, doctor_id))
-    db.commit()
+    current_active = doctor.get("is_active", 1)
+    new_status = 0 if current_active == 1 else 1
+    db.doctors.update_one({"Doctor_ID": doctor_id}, {"$set": {"is_active": new_status}})
 
     action = "deactivated (off-duty)" if new_status == 0 else "reactivated (on-duty)"
-    flash(f"Doctor '{doctor['D_Name']}' has been {action}.", "info")
+    flash(f"Doctor '{doctor.get('D_Name')}' has been {action}.", "info")
     return redirect(request.referrer or url_for("doctors.detail", doctor_id=doctor_id))
 
 
@@ -228,13 +206,12 @@ def toggle_status(doctor_id):
 def delete(doctor_id):
     """Safely handle doctor deletion. Blocks deletion if doctor has existing appointments."""
     db = get_db()
-    doctor = db.execute("SELECT Doctor_ID, D_Name FROM Doctor WHERE Doctor_ID = ?", (doctor_id,)).fetchone()
+    doctor = db.doctors.find_one({"Doctor_ID": doctor_id})
     if doctor is None:
         flash(f"Doctor #{doctor_id} not found.", "warning")
         return redirect(url_for("doctors.index"))
 
-    # Check for historical appointment records
-    appt_count = db.execute("SELECT COUNT(*) FROM Appointment WHERE Doctor_ID = ?", (doctor_id,)).fetchone()[0]
+    appt_count = db.appointments.count_documents({"Doctor_ID": doctor_id})
     if appt_count > 0:
         flash(
             f"Cannot delete Doctor '{doctor['D_Name']}' (ID: #{doctor_id}): "
@@ -245,13 +222,9 @@ def delete(doctor_id):
         return redirect(url_for("doctors.detail", doctor_id=doctor_id))
 
     try:
-        db.execute("DELETE FROM Doctor WHERE Doctor_ID = ?", (doctor_id,))
-        db.commit()
+        db.doctors.delete_one({"Doctor_ID": doctor_id})
         flash(f"Doctor record '{doctor['D_Name']}' (ID: #{doctor_id}) was successfully deleted.", "success")
         return redirect(url_for("doctors.index"))
-    except sqlite3.IntegrityError:
-        flash(
-            f"Cannot delete doctor #{doctor_id} due to active database foreign key constraints.",
-            "danger",
-        )
+    except Exception as e:
+        flash(f"Cannot delete doctor #{doctor_id}: {e}", "danger")
         return redirect(url_for("doctors.detail", doctor_id=doctor_id))

@@ -1,21 +1,13 @@
-import sqlite3
 import pytest
-from app.db import get_db, close_db
+from app.db import get_db, close_db, get_next_sequence_value
 
 
 def test_get_close_db(app):
-    """Test that get_db returns the same connection in context and closes on teardown."""
+    """Test that get_db returns the same connection in context and cleans up on teardown."""
     with app.app_context():
         db = get_db()
         assert db is get_db()
-        # Verify foreign keys are enabled on connection
-        fk_status = db.execute("PRAGMA foreign_keys;").fetchone()[0]
-        assert fk_status == 1
-
-    # Context exited, connection should be closed
-    with pytest.raises(sqlite3.ProgrammingError) as exc_info:
-        db.execute("SELECT 1")
-    assert "closed" in str(exc_info.value).lower()
+        assert db.name == app.config["MONGO_DB_NAME"]
 
 
 def test_init_db_command(runner, monkeypatch):
@@ -28,210 +20,71 @@ def test_init_db_command(runner, monkeypatch):
 
     monkeypatch.setattr("app.db.init_db", fake_init_db)
     result = runner.invoke(args=["init-db"])
-    assert "Initialized the SQLite database successfully." in result.output
+    assert "Initialized the MongoDB database successfully." in result.output
     assert Recorder.called is True
 
 
-def test_patient_constraints(app):
-    """Test Patient check constraints for Age, Gender, and Blood Group."""
+def test_patient_crud_and_sequences(app):
+    """Test Patient sequence generation and collection operations."""
     with app.app_context():
         db = get_db()
-        # Valid insert
-        db.execute(
-            "INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group) VALUES (?, ?, ?, ?)",
-            ("John Doe", 35, "Male", "O+"),
-        )
-        db.commit()
-
-        # Invalid Age (< 0)
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                "INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group) VALUES (?, ?, ?, ?)",
-                ("Invalid Age", -5, "Male", "O+"),
-            )
-
-        # Invalid Gender
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                "INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group) VALUES (?, ?, ?, ?)",
-                ("Invalid Gender", 25, "Alien", "O+"),
-            )
-
-        # Invalid Blood Group
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                "INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group) VALUES (?, ?, ?, ?)",
-                ("Invalid BG", 25, "Male", "Z+"),
-            )
+        p_id = get_next_sequence_value(db, "Patient_id")
+        db.patients.insert_one({
+            "Patient_id": p_id,
+            "P_Name": "John Doe",
+            "P_Age": 35,
+            "P_Gender": "Male",
+            "Blood_Group": "O+",
+            "is_active": 1,
+        })
+        doc = db.patients.find_one({"Patient_id": p_id})
+        assert doc is not None
+        assert doc["P_Name"] == "John Doe"
+        assert doc["P_Age"] == 35
 
 
-def test_doctor_constraints(app):
-    """Test Doctor constraints."""
+def test_doctor_crud_and_phone(app):
+    """Test Doctor collection insertion and retrieval."""
     with app.app_context():
         db = get_db()
-        # Valid insert
-        db.execute(
-            "INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone) VALUES (?, ?, ?, ?)",
-            ("Dr. Smith", "MD Cardiology", 12, "9876543210"),
-        )
-        db.commit()
+        d_id = get_next_sequence_value(db, "Doctor_ID")
+        db.doctors.insert_one({
+            "Doctor_ID": d_id,
+            "D_Name": "Dr. Smith",
+            "D_Qualification": "MD Cardiology",
+            "Experience": 12,
+            "D_Phone": "9876543210",
+            "is_active": 1,
+        })
+        doc = db.doctors.find_one({"D_Phone": "9876543210"})
+        assert doc is not None
+        assert doc["Doctor_ID"] == d_id
 
-        # Invalid Experience (< 0)
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                "INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone) VALUES (?, ?, ?, ?)",
-                ("Dr. Invalid", "MBBS", -1, "9876543210"),
-            )
 
-
-def test_appointment_foreign_keys_and_restrictions(app):
-    """Test Appointment foreign keys to Patient and Doctor and ON DELETE RESTRICT behavior."""
+def test_appointment_and_bill_sequences(app):
+    """Test atomic sequence generation for appointments and bills."""
     with app.app_context():
         db = get_db()
-        # Setup valid Patient & Doctor
-        cur = db.cursor()
-        cur.execute(
-            "INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group) VALUES (?, ?, ?, ?)",
-            ("Alice", 28, "Female", "A+"),
-        )
-        patient_id = cur.lastrowid
-
-        cur.execute(
-            "INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone) VALUES (?, ?, ?, ?)",
-            ("Dr. Bob", "MD Neurology", 8, "9988776655"),
-        )
-        doctor_id = cur.lastrowid
-        db.commit()
-
-        # Valid Appointment
-        cur.execute(
-            """INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason, Duration_Min, Status)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (patient_id, doctor_id, "2026-10-15", "10:00", "Regular Checkup", 30, "Scheduled"),
-        )
-        db.commit()
-
-        # Foreign Key Violation: Non-existent Patient
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                """INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (9999, doctor_id, "2026-10-15", "11:00", "Consultation"),
-            )
-
-        # Foreign Key Violation: Non-existent Doctor
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                """INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (patient_id, 9999, "2026-10-15", "11:00", "Consultation"),
-            )
-
-        # ON DELETE RESTRICT: Cannot delete Patient while appointment exists
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute("DELETE FROM Patient WHERE Patient_id = ?", (patient_id,))
-
-        # ON DELETE RESTRICT: Cannot delete Doctor while appointment exists
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute("DELETE FROM Doctor WHERE Doctor_ID = ?", (doctor_id,))
+        a_id_1 = get_next_sequence_value(db, "Appointment_ID")
+        a_id_2 = get_next_sequence_value(db, "Appointment_ID")
+        b_id = get_next_sequence_value(db, "Bill_ID")
+        assert a_id_2 == a_id_1 + 1
+        assert b_id >= 1
 
 
-def test_bill_foreign_keys_and_constraints(app):
-    """Test Bill foreign key to Patient, check constraints, and ON DELETE RESTRICT."""
+def test_user_admin_initialized(app):
+    """Test default admin user is initialized upon init_db."""
     with app.app_context():
         db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            "INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group) VALUES (?, ?, ?, ?)",
-            ("Charlie", 45, "Male", "B+"),
-        )
-        patient_id = cur.lastrowid
-        db.commit()
-
-        # Valid Bill
-        cur.execute(
-            "INSERT INTO Bill (Patient_id, B_Date, B_Amount, Pay_Mode) VALUES (?, ?, ?, ?)",
-            (patient_id, "2026-10-12", 1500.50, "UPI"),
-        )
-        db.commit()
-
-        # Invalid: Non-existent Patient
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                "INSERT INTO Bill (Patient_id, B_Date, B_Amount, Pay_Mode) VALUES (?, ?, ?, ?)",
-                (9999, "2026-10-12", 500.00, "Cash"),
-            )
-
-        # Invalid: Non-positive Amount
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                "INSERT INTO Bill (Patient_id, B_Date, B_Amount, Pay_Mode) VALUES (?, ?, ?, ?)",
-                (patient_id, "2026-10-12", 0.00, "Cash"),
-            )
-
-        # Invalid: Unsupported Pay Mode
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                "INSERT INTO Bill (Patient_id, B_Date, B_Amount, Pay_Mode) VALUES (?, ?, ?, ?)",
-                (patient_id, "2026-10-12", 500.00, "Bitcoin"),
-            )
-
-        # ON DELETE RESTRICT: Cannot delete Patient with bill
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute("DELETE FROM Patient WHERE Patient_id = ?", (patient_id,))
-
-
-def test_user_unique_and_role_constraints(app):
-    """Test User unique username and role constraints."""
-    with app.app_context():
-        db = get_db()
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-            ("admin1", "scrypt:hash1", "Admin"),
-        )
-        db.commit()
-
-        # Duplicate username
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-                ("admin1", "scrypt:hash2", "Staff"),
-            )
-
-        # Invalid Role
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-                ("user2", "scrypt:hash3", "SuperAdmin"),
-            )
-
-
-def test_database_persistence(app):
-    """Verify that records persist across distinct database connections to the file."""
-    db_path = app.config["DATABASE"]
-    
-    # Insert record using first connection
-    conn1 = sqlite3.connect(db_path)
-    conn1.execute(
-        "INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group) VALUES ('Persistent Patient', 50, 'Female', 'AB+')",
-    )
-    conn1.commit()
-    conn1.close()
-
-    # Reopen brand new connection to the file
-    conn2 = sqlite3.connect(db_path)
-    row = conn2.execute("SELECT P_Name, P_Age FROM Patient WHERE P_Name = 'Persistent Patient'").fetchone()
-    conn2.close()
-
-    assert row is not None
-    assert row[0] == "Persistent Patient"
-    assert row[1] == 50
+        admin = db.users.find_one({"Username": "admin"})
+        assert admin is not None
+        assert admin["Role"] == "Admin"
 
 
 def test_load_dataset_cli_and_seeder(runner, app):
-    """Verify that flask load-dataset CLI command imports dataset CSVs and populates tables."""
+    """Verify that flask load-dataset CLI command imports dataset CSVs into MongoDB."""
     result = runner.invoke(args=["load-dataset"])
-    assert "Dataset loaded successfully:" in result.output
+    assert "MongoDB dataset loaded successfully:" in result.output
     assert "50 patients" in result.output
     assert "10 doctors" in result.output
     assert "200 appointments" in result.output
@@ -239,7 +92,7 @@ def test_load_dataset_cli_and_seeder(runner, app):
 
     with app.app_context():
         db = get_db()
-        assert db.execute("SELECT COUNT(*) FROM Patient").fetchone()[0] == 50
-        assert db.execute("SELECT COUNT(*) FROM Doctor").fetchone()[0] == 10
-        assert db.execute("SELECT COUNT(*) FROM Appointment").fetchone()[0] == 200
-        assert db.execute("SELECT COUNT(*) FROM Bill").fetchone()[0] == 200
+        assert db.patients.count_documents({}) == 50
+        assert db.doctors.count_documents({}) == 10
+        assert db.appointments.count_documents({}) == 200
+        assert db.bills.count_documents({}) == 200

@@ -1,17 +1,23 @@
 import pytest
 from werkzeug.security import generate_password_hash
-from app.db import get_db
+from app.db import get_db, get_next_sequence_value
 
 
 def create_authenticated_user(app, client, username="admin_user", role="Admin"):
     """Helper to register and login a user for dashboard testing."""
     with app.app_context():
         db = get_db()
-        db.execute(
-            "INSERT INTO User (Username, Password_Hash, Role) VALUES (?, ?, ?)",
-            (username, generate_password_hash("pass123"), role),
+        u_id = get_next_sequence_value(db, "User_ID")
+        db.users.update_one(
+            {"Username": username},
+            {"$set": {
+                "User_ID": u_id,
+                "Username": username,
+                "Password_Hash": generate_password_hash("pass123"),
+                "Role": role,
+            }},
+            upsert=True,
         )
-        db.commit()
 
     client.post("/auth/login", data={"username": username, "password": "pass123"})
 
@@ -49,46 +55,52 @@ def test_dashboard_authenticated_empty_state(app, client):
 
 
 def test_dashboard_dynamic_aggregations_and_joins(app, client):
-    """Verify dynamic SQLite aggregation counts and recent appointment/bill table rows with JOINs."""
+    """Verify dynamic aggregation counts and recent appointment/bill table rows."""
     create_authenticated_user(app, client, "hospital_admin", "Admin")
 
     with app.app_context():
         db = get_db()
-        cur = db.cursor()
+        p1 = get_next_sequence_value(db, "Patient_id")
+        p2 = get_next_sequence_value(db, "Patient_id")
+        p3 = get_next_sequence_value(db, "Patient_id")
+        db.patients.insert_one({"Patient_id": p1, "P_Name": "Emily Clark", "P_Age": 32, "P_Gender": "Female", "Blood_Group": "O+", "is_active": 1})
+        db.patients.insert_one({"Patient_id": p2, "P_Name": "David Miller", "P_Age": 45, "P_Gender": "Male", "Blood_Group": "A+", "is_active": 1})
+        db.patients.insert_one({"Patient_id": p3, "P_Name": "Inactive Patient", "P_Age": 60, "P_Gender": "Male", "Blood_Group": "B-", "is_active": 0})
 
-        # Insert Patients (2 active, 1 inactive)
-        cur.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Emily Clark', 32, 'Female', 'O+', 1)")
-        p1 = cur.lastrowid
-        cur.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('David Miller', 45, 'Male', 'A+', 1)")
-        p2 = cur.lastrowid
-        cur.execute("INSERT INTO Patient (P_Name, P_Age, P_Gender, Blood_Group, is_active) VALUES ('Inactive Patient', 60, 'Male', 'B-', 0)")
-        p3 = cur.lastrowid
+        d1 = get_next_sequence_value(db, "Doctor_ID")
+        d2 = get_next_sequence_value(db, "Doctor_ID")
+        d3 = get_next_sequence_value(db, "Doctor_ID")
+        db.doctors.insert_one({"Doctor_ID": d1, "D_Name": "Dr. Gregory House", "D_Qualification": "MD Diagnostics", "Experience": 15, "D_Phone": "555-101", "is_active": 1})
+        db.doctors.insert_one({"Doctor_ID": d2, "D_Name": "Dr. Allison Cameron", "D_Qualification": "MD Immunology", "Experience": 8, "D_Phone": "555-102", "is_active": 1})
+        db.doctors.insert_one({"Doctor_ID": d3, "D_Name": "Dr. Retired", "D_Qualification": "MBBS", "Experience": 30, "D_Phone": "555-103", "is_active": 0})
 
-        # Insert Doctors (2 active, 1 inactive)
-        cur.execute("INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone, is_active) VALUES ('Dr. Gregory House', 'MD Diagnostics', 15, '555-101', 1)")
-        d1 = cur.lastrowid
-        cur.execute("INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone, is_active) VALUES ('Dr. Allison Cameron', 'MD Immunology', 8, '555-102', 1)")
-        d2 = cur.lastrowid
-        cur.execute("INSERT INTO Doctor (D_Name, D_Qualification, Experience, D_Phone, is_active) VALUES ('Dr. Retired', 'MBBS', 30, '555-103', 0)")
-        d3 = cur.lastrowid
+        a1 = get_next_sequence_value(db, "Appointment_ID")
+        a2 = get_next_sequence_value(db, "Appointment_ID")
+        db.appointments.insert_one({
+            "Appointment_ID": a1,
+            "Patient_id": p1,
+            "Doctor_ID": d1,
+            "A_Date": "2026-10-15",
+            "A_Time": "10:00",
+            "Reason": "Cardiac Consultation",
+            "Duration_Min": 30,
+            "Status": "Scheduled",
+        })
+        db.appointments.insert_one({
+            "Appointment_ID": a2,
+            "Patient_id": p2,
+            "Doctor_ID": d2,
+            "A_Date": "2026-10-14",
+            "A_Time": "14:30",
+            "Reason": "Routine Followup",
+            "Duration_Min": 30,
+            "Status": "Completed",
+        })
 
-        # Insert Appointments (1 Scheduled, 1 Completed)
-        cur.execute(
-            """INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason, Duration_Min, Status)
-               VALUES (?, ?, '2026-10-15', '10:00', 'Cardiac Consultation', 30, 'Scheduled')""",
-            (p1, d1),
-        )
-        cur.execute(
-            """INSERT INTO Appointment (Patient_id, Doctor_ID, A_Date, A_Time, Reason, Duration_Min, Status)
-               VALUES (?, ?, '2026-10-14', '14:30', 'Routine Followup', 30, 'Completed')""",
-            (p2, d2),
-        )
-
-        # Insert Bills ($150.00 and $250.50 -> Total $400.50)
-        cur.execute("INSERT INTO Bill (Patient_id, B_Date, B_Amount, Pay_Mode) VALUES (?, '2026-10-14', 150.00, 'Cash')", (p1,))
-        cur.execute("INSERT INTO Bill (Patient_id, B_Date, B_Amount, Pay_Mode) VALUES (?, '2026-10-15', 250.50, 'UPI')", (p2,))
-
-        db.commit()
+        b1 = get_next_sequence_value(db, "Bill_ID")
+        b2 = get_next_sequence_value(db, "Bill_ID")
+        db.bills.insert_one({"Bill_ID": b1, "Patient_id": p1, "B_Date": "2026-10-14", "B_Amount": 150.00, "Pay_Mode": "Cash"})
+        db.bills.insert_one({"Bill_ID": b2, "Patient_id": p2, "B_Date": "2026-10-15", "B_Amount": 250.50, "Pay_Mode": "UPI"})
 
     # Query dashboard
     response = client.get("/dashboard")
@@ -109,7 +121,7 @@ def test_dashboard_dynamic_aggregations_and_joins(app, client):
     assert b'id="val-bills-count">2</div>' in response.data
     assert b"$400.50" in response.data
 
-    # 5. Appointments table JOIN verification
+    # 5. Appointments table verification
     assert b"Emily Clark" in response.data
     assert b"Dr. Gregory House" in response.data
     assert b"Cardiac Consultation" in response.data
@@ -118,7 +130,7 @@ def test_dashboard_dynamic_aggregations_and_joins(app, client):
     assert b"Scheduled" in response.data
     assert b"Completed" in response.data
 
-    # 6. Bills table JOIN verification
+    # 6. Bills table verification
     assert b"UPI" in response.data
     assert b"Cash" in response.data
     assert b"$150.00" in response.data
@@ -131,7 +143,6 @@ def test_clickable_cards_and_navigation_links(app, client):
     response = client.get("/dashboard")
     assert response.status_code == 200
 
-    # Verify metric cards are clickable anchors
     assert b'id="card-metric-patients"' in response.data
     assert b'id="card-metric-doctors"' in response.data
     assert b'id="card-metric-appointments"' in response.data

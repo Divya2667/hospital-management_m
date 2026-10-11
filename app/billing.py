@@ -1,7 +1,7 @@
-from datetime import date
+from datetime import date, datetime
 from flask import Blueprint, abort, flash, redirect, render_template, request, url_for
 from app.auth import login_required
-from app.db import get_db
+from app.db import get_db, get_next_sequence_value
 from app.validators import ALLOWED_PAYMENT_MODES, validate_bill
 
 bp = Blueprint("billing", __name__, url_prefix="/billing")
@@ -19,57 +19,52 @@ def index():
     date_from = request.args.get("date_from", "").strip()
     date_to = request.args.get("date_to", "").strip()
 
-    base_query = """
-        SELECT b.Bill_ID, b.Patient_id, b.B_Date, b.B_Amount, b.Pay_Mode, b.Created_At,
-               p.P_Name as Patient_Name, p.P_Age as Patient_Age, p.P_Gender as Patient_Gender,
-               p.Blood_Group as Patient_Blood_Group
-        FROM Bill b
-        JOIN Patient p ON b.Patient_id = p.Patient_id
-    """
-    conditions = []
-    params = []
-
-    if q:
-        if q.isdigit():
-            conditions.append("(b.Bill_ID = ? OR p.P_Name LIKE ?)")
-            params.extend([int(q), f"%{q}%"])
-        else:
-            conditions.append("p.P_Name LIKE ?")
-            params.append(f"%{q}%")
-
+    filter_query = {}
     if pay_mode and pay_mode in ALLOWED_PAYMENT_MODES:
-        conditions.append("b.Pay_Mode = ?")
-        params.append(pay_mode)
+        filter_query["Pay_Mode"] = pay_mode
 
-    if date_from:
-        conditions.append("b.B_Date >= ?")
-        params.append(date_from)
+    if date_from and date_to:
+        filter_query["B_Date"] = {"$gte": date_from, "$lte": date_to}
+    elif date_from:
+        filter_query["B_Date"] = {"$gte": date_from}
+    elif date_to:
+        filter_query["B_Date"] = {"$lte": date_to}
 
-    if date_to:
-        conditions.append("b.B_Date <= ?")
-        params.append(date_to)
+    raw_bills = list(db.bills.find(filter_query).sort([("B_Date", -1), ("Bill_ID", -1)]))
+    patients_map = {p["Patient_id"]: p for p in db.patients.find({})}
 
-    where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
-    query = f"{base_query}{where_clause} ORDER BY b.B_Date DESC, b.Bill_ID DESC"
-    bills = db.execute(query, params).fetchall()
+    bills = []
+    for b in raw_bills:
+        p = patients_map.get(b.get("Patient_id"), {})
+        b_copy = dict(b)
+        b_copy["Patient_Name"] = p.get("P_Name", "Unknown Patient")
+        b_copy["Patient_Age"] = p.get("P_Age", "-")
+        b_copy["Patient_Gender"] = p.get("P_Gender", "-")
+        b_copy["Patient_Blood_Group"] = p.get("Blood_Group", "-")
 
-    # Aggregate calculations for filtered results
-    total_revenue = sum(b["B_Amount"] for b in bills)
+        if q:
+            if q.isdigit() and b_copy.get("Bill_ID") != int(q) and q.lower() not in b_copy["Patient_Name"].lower():
+                continue
+            elif not q.isdigit() and q.lower() not in b_copy["Patient_Name"].lower():
+                continue
+
+        bills.append(b_copy)
+
+    total_revenue = sum(b.get("B_Amount", 0.0) for b in bills)
     total_invoices = len(bills)
     avg_invoice = (total_revenue / total_invoices) if total_invoices > 0 else 0.0
 
-    # Payment mode breakdown for filtered dataset
     mode_breakdown = {mode: {"count": 0, "amount": 0.0} for mode in ALLOWED_PAYMENT_MODES}
     for b in bills:
-        m = b["Pay_Mode"]
+        m = b.get("Pay_Mode")
         if m in mode_breakdown:
             mode_breakdown[m]["count"] += 1
-            mode_breakdown[m]["amount"] += b["B_Amount"]
+            mode_breakdown[m]["amount"] += b.get("B_Amount", 0.0)
 
-    # Lifetime overall totals for context
-    lifetime = db.execute(
-        "SELECT COUNT(*) as count, COALESCE(SUM(B_Amount), 0.0) as total FROM Bill"
-    ).fetchone()
+    lifetime_count = db.bills.count_documents({})
+    pipeline = [{"$group": {"_id": None, "total": {"$sum": "$B_Amount"}}}]
+    res = list(db.bills.aggregate(pipeline))
+    lifetime_revenue = res[0]["total"] if res else 0.0
 
     return render_template(
         "billing/index.html",
@@ -78,8 +73,8 @@ def index():
         total_invoices=total_invoices,
         avg_invoice=avg_invoice,
         mode_breakdown=mode_breakdown,
-        lifetime_count=lifetime["count"] if lifetime else 0,
-        lifetime_revenue=lifetime["total"] if lifetime else 0.0,
+        lifetime_count=lifetime_count,
+        lifetime_revenue=lifetime_revenue,
         search_query=q,
         current_pay_mode=pay_mode,
         current_date_from=date_from,
@@ -94,11 +89,7 @@ def create():
     """Create a new hospital invoice / billing record."""
     db = get_db()
     today_str = date.today().isoformat()
-
-    # Fetch active patients for billing assignment
-    patients = db.execute(
-        "SELECT Patient_id, P_Name, P_Age, P_Gender, Blood_Group FROM Patient WHERE is_active = 1 ORDER BY P_Name ASC"
-    ).fetchall()
+    patients = list(db.patients.find({"is_active": 1}).sort("P_Name", 1))
 
     if request.method == "POST":
         patient_id_raw = request.form.get("patient_id")
@@ -131,20 +122,15 @@ def create():
                 today_str=today_str,
             )
 
-        cursor = db.execute(
-            """
-            INSERT INTO Bill (Patient_id, B_Date, B_Amount, Pay_Mode)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                cleaned["Patient_id"],
-                cleaned["B_Date"],
-                cleaned["B_Amount"],
-                cleaned["Pay_Mode"],
-            ),
-        )
-        db.commit()
-        new_bill_id = cursor.lastrowid
+        new_bill_id = get_next_sequence_value(db, "Bill_ID")
+        db.bills.insert_one({
+            "Bill_ID": new_bill_id,
+            "Patient_id": cleaned["Patient_id"],
+            "B_Date": cleaned["B_Date"],
+            "B_Amount": cleaned["B_Amount"],
+            "Pay_Mode": cleaned["Pay_Mode"],
+            "Created_At": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
 
         flash(
             f"Invoice #{new_bill_id} generated successfully for ${cleaned['B_Amount']:.2f}.",
@@ -152,7 +138,6 @@ def create():
         )
         return redirect(url_for("billing.detail", bill_id=new_bill_id))
 
-    # Pre-selection support via query parameter
     preselect_patient_id = request.args.get("patient_id", type=int)
     form_data = {
         "patient_id": preselect_patient_id or "",
@@ -175,34 +160,25 @@ def create():
 def detail(bill_id):
     """Detailed view and printable invoice / receipt for a billing record."""
     db = get_db()
-    bill = db.execute(
-        """
-        SELECT b.Bill_ID, b.Patient_id, b.B_Date, b.B_Amount, b.Pay_Mode, b.Created_At,
-               p.P_Name as Patient_Name, p.P_Age as Patient_Age, p.P_Gender as Patient_Gender,
-               p.Blood_Group as Patient_Blood_Group
-        FROM Bill b
-        JOIN Patient p ON b.Patient_id = p.Patient_id
-        WHERE b.Bill_ID = ?
-        """,
-        (bill_id,),
-    ).fetchone()
-
-    if not bill:
+    raw_bill = db.bills.find_one({"Bill_ID": bill_id})
+    if not raw_bill:
         abort(404)
 
-    # Optional clinical context: recent appointments for this patient
-    appointments = db.execute(
-        """
-        SELECT a.Appointment_ID, a.A_Date, a.A_Time, a.Reason, a.Status,
-               d.D_Name as Doctor_Name, d.D_Qualification
-        FROM Appointment a
-        JOIN Doctor d ON a.Doctor_ID = d.Doctor_ID
-        WHERE a.Patient_id = ?
-        ORDER BY a.A_Date DESC, a.A_Time DESC
-        LIMIT 3
-        """,
-        (bill["Patient_id"],),
-    ).fetchall()
+    patient = db.patients.find_one({"Patient_id": raw_bill.get("Patient_id")}) or {}
+    bill = dict(raw_bill)
+    bill["Patient_Name"] = patient.get("P_Name", "Unknown Patient")
+    bill["Patient_Age"] = patient.get("P_Age", "-")
+    bill["Patient_Gender"] = patient.get("P_Gender", "-")
+    bill["Patient_Blood_Group"] = patient.get("Blood_Group", "-")
+
+    raw_appts = list(db.appointments.find({"Patient_id": raw_bill.get("Patient_id")}).sort([("A_Date", -1), ("A_Time", -1)]).limit(3))
+    appointments = []
+    for a in raw_appts:
+        d = db.doctors.find_one({"Doctor_ID": a.get("Doctor_ID")}) or {}
+        a_copy = dict(a)
+        a_copy["Doctor_Name"] = d.get("D_Name", "Unknown Doctor")
+        a_copy["D_Qualification"] = d.get("D_Qualification", "")
+        appointments.append(a_copy)
 
     return render_template(
         "billing/detail.html",
@@ -216,30 +192,17 @@ def detail(bill_id):
 def edit(bill_id):
     """Edit an existing billing record."""
     db = get_db()
-    bill = db.execute(
-        """
-        SELECT b.Bill_ID, b.Patient_id, b.B_Date, b.B_Amount, b.Pay_Mode,
-               p.P_Name as Patient_Name
-        FROM Bill b
-        JOIN Patient p ON b.Patient_id = p.Patient_id
-        WHERE b.Bill_ID = ?
-        """,
-        (bill_id,),
-    ).fetchone()
-
-    if not bill:
+    raw_bill = db.bills.find_one({"Bill_ID": bill_id})
+    if not raw_bill:
         abort(404)
 
-    # All active patients plus the currently selected patient if they are inactive
-    patients = db.execute(
-        """
-        SELECT Patient_id, P_Name, P_Age, P_Gender, Blood_Group
-        FROM Patient
-        WHERE is_active = 1 OR Patient_id = ?
-        ORDER BY P_Name ASC
-        """,
-        (bill["Patient_id"],),
-    ).fetchall()
+    patient = db.patients.find_one({"Patient_id": raw_bill.get("Patient_id")}) or {}
+    bill = dict(raw_bill)
+    bill["Patient_Name"] = patient.get("P_Name", "Unknown Patient")
+
+    patients = list(db.patients.find({
+        "$or": [{"is_active": 1}, {"Patient_id": raw_bill.get("Patient_id")}]
+    }).sort("P_Name", 1))
 
     if request.method == "POST":
         patient_id_raw = request.form.get("patient_id")
@@ -272,21 +235,15 @@ def edit(bill_id):
                 allowed_modes=ALLOWED_PAYMENT_MODES,
             )
 
-        db.execute(
-            """
-            UPDATE Bill
-            SET Patient_id = ?, B_Date = ?, B_Amount = ?, Pay_Mode = ?
-            WHERE Bill_ID = ?
-            """,
-            (
-                cleaned["Patient_id"],
-                cleaned["B_Date"],
-                cleaned["B_Amount"],
-                cleaned["Pay_Mode"],
-                bill_id,
-            ),
+        db.bills.update_one(
+            {"Bill_ID": bill_id},
+            {"$set": {
+                "Patient_id": cleaned["Patient_id"],
+                "B_Date": cleaned["B_Date"],
+                "B_Amount": cleaned["B_Amount"],
+                "Pay_Mode": cleaned["Pay_Mode"],
+            }}
         )
-        db.commit()
 
         flash(f"Invoice #{bill_id} updated successfully.", "success")
         return redirect(url_for("billing.detail", bill_id=bill_id))
@@ -312,15 +269,10 @@ def edit(bill_id):
 def delete(bill_id):
     """Delete a billing record."""
     db = get_db()
-    bill = db.execute(
-        "SELECT Bill_ID, B_Amount FROM Bill WHERE Bill_ID = ?", (bill_id,)
-    ).fetchone()
-
+    bill = db.bills.find_one({"Bill_ID": bill_id})
     if not bill:
         abort(404)
 
-    db.execute("DELETE FROM Bill WHERE Bill_ID = ?", (bill_id,))
-    db.commit()
-
-    flash(f"Invoice #{bill_id} (${bill['B_Amount']:.2f}) was permanently deleted.", "info")
+    db.bills.delete_one({"Bill_ID": bill_id})
+    flash(f"Invoice #{bill_id} (${bill.get('B_Amount', 0.0):.2f}) was permanently deleted.", "info")
     return redirect(url_for("billing.index"))
