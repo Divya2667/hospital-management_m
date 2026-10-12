@@ -26,3 +26,4 @@ htmlcov/
 Thumbs.db
 .vscode/
 .idea/
+*.exe
